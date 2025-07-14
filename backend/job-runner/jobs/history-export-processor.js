@@ -1299,6 +1299,20 @@ async function fetchThreadReplies(accessToken, channelId, threadTs, userToken = 
 
 async function saveMessageToDatabase(connectionId, channelId, channelName, message) {
   try {
+    let finalChannelName = channelName;
+    if (!finalChannelName || finalChannelName === 'Unknown') {
+      const connection = await prisma.slackConnection.findFirst({ where: { id: connectionId } });
+      if (connection) {
+        const channelInfo = await getChannelInfo(connection.accessToken, channelId);
+        if (channelInfo && channelInfo.name) {
+          finalChannelName = channelInfo.name;
+        } else {
+          finalChannelName = 'Unknown';
+        }
+      } else {
+        finalChannelName = 'Unknown';
+      }
+    }
     await prisma.slackConversation.upsert({
       where: {
         slackConnectionId_messageTs: {
@@ -1313,13 +1327,14 @@ async function saveMessageToDatabase(connectionId, channelId, channelName, messa
         slackConnectionId: connectionId,
         messageTs: message.ts,
         channelId: channelId,
-        channelName: channelName,
+        channelName: finalChannelName,
         userId: message.user || '',
         userName: '', // Will be populated later if needed
         messageText: message.text || '',
         messageType: channelId.startsWith('D') ? 'dm' : 'channel',
         participants: [],
-        tags: []
+        tags: [],
+        slackSentAt: message.ts ? new Date(parseFloat(message.ts) * 1000) : undefined
       }
     });
   } catch (error) {
@@ -1498,7 +1513,7 @@ async function createMultipleDocuments(documentName, formattedContent, targetFol
     let remainingContent = formattedContent;
     while (new TextEncoder().encode(remainingContent).length > maxDocumentSize) {
       // Find a split point
-      let splitIndex = Math.floor(remainingConteynt.length * maxDocumentSize / new TextEncoder().encode(remainingContent).length);
+      let splitIndex = Math.floor(remainingContent.length * maxDocumentSize / new TextEncoder().encode(remainingContent).length);
       splitIndex = remainingContent.lastIndexOf('\n', splitIndex);
       if (splitIndex <= 0) splitIndex = Math.floor(remainingContent.length / 2);
       contentParts.push(remainingContent.slice(0, splitIndex));

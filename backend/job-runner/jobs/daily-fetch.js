@@ -262,7 +262,8 @@ async function saveMessageToDatabase(connectionId, channelId, channelName, messa
         messageText: message.text,
         participants: [],
         tags: [],
-        createdAt: new Date(parseFloat(message.ts) * 1000)
+        createdAt: new Date(parseFloat(message.ts) * 1000),
+        slackSentAt: message.ts ? new Date(parseFloat(message.ts) * 1000) : undefined
       }
     });
 

@@ -3225,20 +3225,37 @@ async function saveMessageToDatabase(connectionId, channelId, channelName, messa
       });
     }
 
+    // If channelName is missing or 'Unknown', fetch from Slack
+    let finalChannelName = channelName;
+    if (!finalChannelName || finalChannelName === 'Unknown') {
+      const connection = await prisma.slackConnection.findFirst({ where: { id: connectionId } });
+      if (connection) {
+        const channelInfo = await getChannelInfo(connection.accessToken, channelId);
+        if (channelInfo && channelInfo.name) {
+          finalChannelName = channelInfo.name;
+        } else {
+          finalChannelName = 'Unknown';
+        }
+      } else {
+        finalChannelName = 'Unknown';
+      }
+    }
+
     // Save to database
     await prisma.slackConversation.create({
       data: {
         slackConnectionId: connectionId,
         messageTs: message.ts,
         channelId: channelId,
-        channelName: channelName || 'Unknown',
+        channelName: finalChannelName,
         userId: message.user || 'unknown',
         userName: userName,
         messageText: message.text || '',
         messageType: messageType,
         threadTs: message.thread_ts || null,
         participants: participants,
-        tags: [] // We could add AI-based tagging later
+        tags: [], // We could add AI-based tagging later
+        slackSentAt: message.ts ? new Date(parseFloat(message.ts) * 1000) : undefined
       }
     });
 
@@ -3657,16 +3674,24 @@ router.delete('/admin/scraping-jobs/:jobId', authenticateToken, requireAdmin, as
       return res.status(404).json({ error: 'Job not found' });
     }
     
+    // Delete all SlackConversation records for this job's channel and slackConnectionId
+    await prisma.slackConversation.deleteMany({
+      where: {
+        slackConnectionId: job.slackConnectionId,
+        channelId: job.channelId
+      }
+    });
+    
     // Delete the job
     await prisma.slackScrapingJob.delete({
       where: { id: jobId }
     });
     
-    console.log(`✅ Admin deleted scraping job: ${jobId}`);
+    console.log(`✅ Admin deleted scraping job and corresponding Slack messages: ${jobId}`);
     
     res.json({
       success: true,
-      message: 'Scraping job deleted successfully',
+      message: 'Scraping job and corresponding Slack messages deleted successfully',
       jobId
     });
   } catch (error) {

@@ -35,10 +35,47 @@ const requireAdmin = (req, res, next) => {
   next();
 };
 
+// Get channels for a workspace
+router.get('/channels', authenticateToken, requireAdmin, async (req, res) => {
+  const { connectionId } = req.query;
+  if (!connectionId) return res.status(400).json({ error: 'connectionId required' });
+  const channels = await prisma.slackConversation.findMany({
+    where: { slackConnectionId: connectionId },
+    select: { channelId: true, channelName: true },
+    distinct: ['channelId', 'channelName'],
+    orderBy: { channelName: 'asc' }
+  });
+  res.json({ channels });
+});
+
+// Get years for a channel in a workspace
+router.get('/years', authenticateToken, requireAdmin, async (req, res) => {
+  const { connectionId, channelId } = req.query;
+  if (!connectionId || !channelId) return res.status(400).json({ error: 'connectionId and channelId required' });
+  const messages = await prisma.slackConversation.findMany({
+    where: { slackConnectionId: connectionId, channelId },
+    select: { slackSentAt: true, createdAt: true }
+  });
+
+  const years = [
+    ...new Set(
+      messages
+        .map(m => {
+          const date = m.slackSentAt;
+          // console.log('date', date);
+          return date ? date.getFullYear() : null;
+        })
+        .filter(year => year !== null)
+    )
+  ].sort((a, b) => b - a);
+
+  res.json({ years });
+});
+
 // Trigger analysis for user's conversations (admin only)
 router.post('/run', authenticateToken, requireAdmin, async (req, res) => {
   try {
-    const { connectionId, dateRange } = req.body;
+    const { connectionId, channelId, year, dateRange } = req.body;
     
     // Get connections (admin can analyze all connections)
     const connections = connectionId 
@@ -56,7 +93,8 @@ router.post('/run', authenticateToken, requireAdmin, async (req, res) => {
     const results = [];
     
     for (const connection of connections) {
-      const analysisResult = await analyzeConnectionConversations(connection, dateRange);
+      const analysisResult = await analyzeConnectionConversationsFiltered(connection, { channelId, year, dateRange });
+      console.log('!!!!!!!!analysisResult', analysisResult);
       results.push({
         connectionId: connection.id,
         teamName: connection.slackTeamName,
@@ -402,25 +440,29 @@ router.get('/dashboard-stats', authenticateToken, async (req, res) => {
   }
 });
 
-// Main analysis function
-async function analyzeConnectionConversations(connection, dateRange) {
+
+async function analyzeConnectionConversationsFiltered(connection, { channelId, year, dateRange }) {
   try {
+    // Build where clause
+    const where = { slackConnectionId: connection.id };
+    if (channelId) where.channelId = channelId;
+    if (year) {
+      const start = new Date(`${year}-01-01T00:00:00Z`);
+      const end = new Date(`${parseInt(year) + 1}-01-01T00:00:00Z`);
+      where.slackSentAt = { gte: start, lt: end };
+    } else if (dateRange?.from) {
+      where.slackSentAt = { gte: new Date(dateRange.from) };
+    }
     // Get conversations for analysis
     const conversations = await prisma.slackConversation.findMany({
-      where: {
-        slackConnectionId: connection.id,
-        createdAt: {
-          gte: dateRange?.from ? new Date(dateRange.from) : new Date(Date.now() - 7 * 24 * 60 * 60 * 1000)
-        }
-      },
-      orderBy: { createdAt: 'desc' },
-      take: 1000 // Limit to avoid token limits
+      where,
+      orderBy: { slackSentAt: 'desc' },
+      take: 10 // Limit to avoid token limits
     });
-
+    console.log('!!!!!!!!conversations.length', conversations.length);
     if (conversations.length === 0) {
       return { tasksFound: 0, message: 'No conversations found for analysis' };
     }
-
     // Prepare conversation data for AI analysis
     const conversationText = conversations.map(conv => ({
       channel: conv.channelName || 'DM',
@@ -428,13 +470,11 @@ async function analyzeConnectionConversations(connection, dateRange) {
       participants: conv.participants,
       timestamp: conv.createdAt
     }));
-
     // Analyze with OpenAI
     const analysis = await analyzeWithOpenAI(conversationText);
-    
+    console.log('!!!!!!!!analysis', analysis);
     // Store results
     const tasks = await storeAnalysisResults(connection.id, conversations, analysis);
-    
     return {
       tasksFound: tasks.length,
       message: `Found ${tasks.length} potential automation tasks`
@@ -470,6 +510,8 @@ Return your analysis as a JSON array of task objects.
 Conversations:
 ${JSON.stringify(conversations, null, 2)}`;
 
+  console.log('!!!!!!!!prompt', prompt);
+
   const response = await openai.chat.completions.create({
     model: 'gpt-4',
     messages: [{ role: 'user', content: prompt }],
@@ -491,20 +533,36 @@ async function storeAnalysisResults(connectionId, conversations, analysis) {
   
   for (const task of analysis) {
     try {
+      if (
+        typeof task['Task Description'] !== 'string' ||
+        !task['Task Description'].trim()
+      ) {
+        // Skip tasks with missing or empty description
+        continue;
+      }
       // Find the most relevant conversation for this task
       const relevantConversation = conversations.find(conv => 
-        conv.messageText.toLowerCase().includes(task.taskDescription.toLowerCase().split(' ')[0])
+        typeof conv.messageText === 'string' &&
+        typeof task['Task Description'] === 'string' &&
+        task['Task Description'].trim() &&
+        conv.messageText.toLowerCase().includes(
+          task['Task Description'].toLowerCase().split(' ')[0]
+        )
       ) || conversations[0];
 
       const createdTask = await prisma.automationTask.create({
         data: {
           slackConversationId: relevantConversation.id,
-          taskDescription: task.taskDescription,
-          frequency: task.frequency,
-          difficulty: task.difficulty,
-          estimatedRoi: task.estimatedRoi,
-          suggestedTools: task.suggestedTools || [],
-          confidence: task.confidence || 0.5,
+          taskDescription: task['Task Description'],
+          frequency: task.Frequency,
+          difficulty: task.Difficulty,
+          estimatedRoi: task['Estimated ROI'],
+          suggestedTools: Array.isArray(task['Suggested Tools'])
+            ? task['Suggested Tools']
+            : typeof task['Suggested Tools'] === 'string'
+              ? task['Suggested Tools'].split(',').map(t => t.trim()).filter(Boolean)
+              : [],
+          confidence: task['Confidence'] || 0.5,
           status: 'pending'
         }
       });

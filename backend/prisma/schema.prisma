@@ -4,7 +4,7 @@ generator client {
 
 datasource db {
   provider = "postgresql"
-  url      = env("DATABASE_URL")
+  url      = "postgresql://apoorvaverma@localhost:5432/autominer"
 }
 
 model User {
@@ -82,6 +82,7 @@ model SlackConversation {
   participants      String[]
   tags              String[]
   createdAt         DateTime         @default(now())
+  slackSentAt       DateTime
   automationTasks   AutomationTask[]
   slackConnection   SlackConnection  @relation(fields: [slackConnectionId], references: [id], onDelete: Cascade)
 
