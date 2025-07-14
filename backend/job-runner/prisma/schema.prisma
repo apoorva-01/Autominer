@@ -1,0 +1,155 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id                String                  @id @default(cuid())
+  email             String                  @unique
+  name              String?
+  password          String
+  createdAt         DateTime                @default(now())
+  updatedAt         DateTime                @updatedAt
+  role              String                  @default("user")
+  reports           AutomationReport[]
+  channelSelections SlackChannelSelection[]
+  slackConnections  SlackConnection[]
+
+  @@map("users")
+}
+
+model SlackConnection {
+  id                String                  @id @default(cuid())
+  userId            String
+  slackUserId       String
+  slackTeamId       String
+  slackTeamName     String
+  pipedreamConnId   String?
+  accessToken       String?
+  scopes            String[]
+  isActive          Boolean                 @default(true)
+  createdAt         DateTime                @default(now())
+  updatedAt         DateTime                @updatedAt
+  userToken         String?
+  channelSelections SlackChannelSelection[]
+  user              User                    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  conversations     SlackConversation[]
+  scrapingJobs      SlackScrapingJob[]
+
+  @@unique([userId, slackTeamId])
+  @@map("slack_connections")
+}
+
+model SlackScrapingJob {
+  id                String          @id @default(cuid())
+  slackConnectionId String
+  channelId         String
+  channelName       String?
+  channelType       String
+  status            String          @default("pending")
+  progress          Int             @default(0)
+  messagesScraped   Int             @default(0)
+  totalMessages     Int?
+  lastMessageTs     String?
+  errorMessage      String?
+  startedAt         DateTime?
+  completedAt       DateTime?
+  createdAt         DateTime        @default(now())
+  updatedAt         DateTime        @updatedAt
+  jobType           String?
+  notes             String?
+  slackConnection   SlackConnection @relation(fields: [slackConnectionId], references: [id], onDelete: Cascade)
+
+  @@unique([slackConnectionId, channelId])
+  @@map("slack_scraping_jobs")
+}
+
+model SlackConversation {
+  id                String           @id @default(cuid())
+  slackConnectionId String
+  messageTs         String
+  channelId         String
+  channelName       String?
+  userId            String
+  userName          String?
+  messageText       String
+  messageType       String
+  threadTs          String?
+  participants      String[]
+  tags              String[]
+  createdAt         DateTime         @default(now())
+  automationTasks   AutomationTask[]
+  slackConnection   SlackConnection  @relation(fields: [slackConnectionId], references: [id], onDelete: Cascade)
+
+  @@unique([slackConnectionId, messageTs])
+  @@map("slack_conversations")
+}
+
+model AutomationTask {
+  id                  String                 @id @default(cuid())
+  slackConversationId String
+  taskDescription     String
+  frequency           String
+  difficulty          String
+  estimatedRoi        String
+  suggestedTools      String[]
+  confidence          Float
+  status              String                 @default("pending")
+  createdAt           DateTime               @default(now())
+  reports             AutomationReportTask[]
+  slackConversation   SlackConversation      @relation(fields: [slackConversationId], references: [id], onDelete: Cascade)
+
+  @@map("automation_tasks")
+}
+
+model AutomationReport {
+  id        String                 @id @default(cuid())
+  userId    String
+  title     String
+  period    String
+  startDate DateTime
+  endDate   DateTime
+  createdAt DateTime               @default(now())
+  tasks     AutomationReportTask[]
+  user      User                   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("automation_reports")
+}
+
+model AutomationReportTask {
+  id               String           @id @default(cuid())
+  reportId         String
+  automationTaskId String
+  rank             Int
+  automationTask   AutomationTask   @relation(fields: [automationTaskId], references: [id], onDelete: Cascade)
+  report           AutomationReport @relation(fields: [reportId], references: [id], onDelete: Cascade)
+
+  @@unique([reportId, automationTaskId])
+  @@map("automation_report_tasks")
+}
+
+model SlackChannelSelection {
+  id                 String          @id @default(cuid())
+  userId             String
+  slackConnectionId  String
+  channelId          String
+  channelName        String?
+  channelType        String
+  isActive           Boolean         @default(true)
+  lastFetchedAt      DateTime?
+  totalMessages      Int             @default(0)
+  createdAt          DateTime        @default(now())
+  updatedAt          DateTime        @updatedAt
+  dailyExportEnabled Boolean         @default(false)
+  googleDocId        String?
+  googleDocUrl       String?
+  slackConnection    SlackConnection @relation(fields: [slackConnectionId], references: [id], onDelete: Cascade)
+  user               User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([slackConnectionId, channelId])
+  @@map("slack_channel_selections")
+}
