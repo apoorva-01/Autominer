@@ -21,7 +21,7 @@ app.use(cors({
 // Rate limiting - more flexible approach
 const globalLimiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 500, // limit each IP to 500 requests per windowMs
+  max: 1000, // increased from 500 to 1000 requests per windowMs
   skip: (req) => {
     // Skip rate limiting for auth endpoints
     return req.path.startsWith('/api/auth/');
@@ -36,8 +36,29 @@ const authLimiter = rateLimit({
   message: { error: 'Too many authentication attempts, please try again later' }
 });
 
+// Admin endpoints rate limiter
+const adminLimiter = rateLimit({
+  windowMs: 5 * 60 * 1000, // 5 minutes
+  max: 300, // 300 requests per 5 minutes
+  message: { error: 'Too many admin API requests, please try again later' }
+});
+
+// Analysis endpoints rate limiter
+const analysisLimiter = rateLimit({
+  windowMs: 5 * 60 * 1000, // 5 minutes
+  max: 300, // 300 requests per 5 minutes
+  message: { error: 'Too many analysis API requests, please try again later' }
+});
+
+// Slack endpoints rate limiter
+const slackLimiter = rateLimit({
+  windowMs: 5 * 60 * 1000, // 5 minutes
+  max: 300, // 300 requests per 5 minutes
+  message: { error: 'Too many Slack API requests, please try again later' }
+});
+
 // Logging
-app.use(morgan('combined'));
+app.use(morgan('tiny'));
 
 // Body parsing
 app.use(express.json({ limit: '10mb' }));
@@ -54,8 +75,9 @@ app.get('/health', (req, res) => {
 
 // API routes
 app.use('/api/auth', authLimiter, require('./routes/auth'));
-app.use('/api/slack', require('./routes/slack'));
-app.use('/api/analysis', require('./routes/analysis'));
+app.use('/api/admin', adminLimiter, require('./routes/admin'));
+app.use('/api/analysis', analysisLimiter, require('./routes/analysis'));
+app.use('/api/slack', slackLimiter, require('./routes/slack'));
 app.use('/api/reports', require('./routes/reports'));
 
 // Error handling middleware

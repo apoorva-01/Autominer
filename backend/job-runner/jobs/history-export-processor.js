@@ -48,29 +48,44 @@ if (process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_CLIENT_SECRET && process.
 
 // Google Drive folder cache to avoid repeated API calls
 const folderCache = new Map();
+const FOLDER_CACHE_MAX_SIZE = 100; // Maximum number of entries in the cache
+const FOLDER_CACHE_TTL = 30 * 60 * 1000; // 30 minutes TTL
 
 // Helper function to set up Google Drive folders
 async function setupGoogleDriveFolders(year, userInfo) {
   const cacheKey = `folders-${year}-${userInfo?.userId || 'default'}`;
   
+  // Check if we have a valid, non-expired entry in the cache
   if (folderCache.has(cacheKey)) {
-    return folderCache.get(cacheKey);
+    const cachedEntry = folderCache.get(cacheKey);
+    const isExpired = cachedEntry.timestamp + FOLDER_CACHE_TTL < Date.now();
+    
+    if (!isExpired) {
+      console.log(`🗂️ Using cached folder structure for ${year} - User: ${userInfo?.teamName || 'Unknown'}`);
+      return cachedEntry.folders;
+    } else {
+      console.log(`🗂️ Cached folder structure expired for ${year} - User: ${userInfo?.teamName || 'Unknown'}`);
+      folderCache.delete(cacheKey);
+    }
   }
 
   try {
     console.log(`🗂️ Setting up Google Drive folder structure for ${year} - User: ${userInfo?.teamName || 'Unknown'}`);
     
     let rootFolderId;
-    
-    // Check if specific folder ID is provided, otherwise find by name
-    const specificFolderId = process.env.GOOGLE_ROOT_FOLDER_ID || '1z-L2x2iAuCRyDu-M9Oee7oJw_FsMhmqY';
+    // Use different root folder ID for dev and prod
+    let specificFolderId;
+    if (process.env.NODE_ENV === 'development') {
+      specificFolderId = process.env.GOOGLE_ROOT_FOLDER_ID_DEV || process.env.GOOGLE_ROOT_FOLDER_ID || '1z-L2x2iAuCRyDu-M9Oee7oJw_FsMhmqY';
+    } else {
+      specificFolderId = process.env.GOOGLE_ROOT_FOLDER_ID || '1z-L2x2iAuCRyDu-M9Oee7oJw_FsMhmqY';
+    }
     const rootFolderName = process.env.GOOGLE_ROOT_FOLDER_NAME || 'Slack Automation Discovery';
     
     if (specificFolderId && specificFolderId !== 'auto') {
       // Use specific folder ID
       rootFolderId = specificFolderId;
       console.log(`📁 Using specified root folder ID: ${rootFolderId}`);
-      
       // Verify folder exists and is accessible
       try {
         const folderInfo = await drive.files.get({
@@ -117,7 +132,19 @@ async function setupGoogleDriveFolders(year, userInfo) {
       channelFolderId
     };
     
-    folderCache.set(cacheKey, folders);
+    // If the cache is too large, remove the oldest entry
+    if (folderCache.size >= FOLDER_CACHE_MAX_SIZE) {
+      const oldestKey = [...folderCache.keys()][0]; // Get the first key (oldest entry due to insertion order)
+      folderCache.delete(oldestKey);
+      console.log(`🗂️ Folder cache full, removing oldest entry: ${oldestKey}`);
+    }
+    
+    // Store with timestamp for TTL tracking
+    folderCache.set(cacheKey, {
+      folders,
+      timestamp: Date.now()
+    });
+    
     return folders;
   } catch (error) {
     console.error('Error setting up Google Drive folders:', error);
@@ -180,7 +207,11 @@ class SlackRateLimiter {
       'conversations.history': 0,
       'channels.history': 0,
       'groups.history': 0,
-      'im.history': 0
+      'im.history': 0,
+      'conversations.replies': 0,
+      'users.list': 0,
+      'auth.test': 0,
+      'apps.auth.test': 0
     };
     
     // Method-specific rate limits (in ms)
@@ -190,6 +221,10 @@ class SlackRateLimiter {
       'channels.history': 1000,
       'groups.history': 1000,
       'im.history': 1000,
+      'conversations.replies': 1000,
+      'users.list': 1000,
+      'auth.test': 1000,
+      'apps.auth.test': 1000,
       // Default for other methods
       'default': 100 // 100ms for other methods
     };
@@ -202,7 +237,11 @@ class SlackRateLimiter {
         'conversations.history': nonMarketplaceLimit,
         'channels.history': nonMarketplaceLimit,
         'groups.history': nonMarketplaceLimit,
-        'im.history': nonMarketplaceLimit
+        'im.history': nonMarketplaceLimit,
+        'conversations.replies': nonMarketplaceLimit,
+        'users.list': nonMarketplaceLimit,
+        'auth.test': nonMarketplaceLimit,
+        'apps.auth.test': nonMarketplaceLimit
       };
       console.log('⚠️ Using stricter rate limits for non-Marketplace Slack app');
     } else {
@@ -332,10 +371,24 @@ async function processHistoryExportJob(connection, job) {
       }
     });
 
-    console.log(`📚 Starting FULL history export for ${job.channelId} (type: ${job.channelType}) - NO LIMITS`);
+    console.log(`📚 Starting history export for ${job.channelId} (type: ${job.channelType})`);
+    
+    // Parse exportRange from job.params if available
+    let exportRange = { type: 'full' }; // Default to full export
+    try {
+      if (job.params && typeof job.params === 'string') {
+        const parsedParams = JSON.parse(job.params);
+        if (parsedParams.range) {
+          exportRange = parsedParams.range;
+          console.log(`📅 Using custom export range: ${JSON.stringify(exportRange)}`);
+        }
+      }
+    } catch (parseError) {
+      console.warn(`⚠️ Error parsing job params: ${parseError.message}. Defaulting to full export.`);
+    }
     
     // Verify token scopes before starting - prioritize user token
-    const tokenToUse = connection.userToken || connection.accessToken;
+    const tokenToUse = connection.userToken;
     const tokenVerification = await verifyTokenScopes(tokenToUse, job.channelId);
     
     if (!tokenVerification.ok) {
@@ -363,7 +416,6 @@ async function processHistoryExportJob(connection, job) {
     
     // Determine appropriate batch size based on app status
     // For non-Marketplace apps after May 2025, limit will be capped at 15
-    console.log('!!!!!!!!!!!!!!!!!!!!!SLACK_APP_IS_MARKETPLACE:', process.env.SLACK_APP_IS_MARKETPLACE);
     const isMarketplaceApp = process.env.SLACK_APP_IS_MARKETPLACE === 'true';
     const batchSize = isMarketplaceApp ? 1000 : 
                      (new Date() > new Date('2025-05-29')) ? 15 : 200;
@@ -384,7 +436,11 @@ async function processHistoryExportJob(connection, job) {
     let totalDelayTime = 0;
     const startTime = Date.now();
 
+    // Add a cache to suppress repeated channel info lookups on failure
+    const failedChannelInfoLookups = new Set();
+
     // For DMs, use existing channel ID directly
+    let dmParticipants = [];
     if (job.channelType === 'dm') {
       console.log(`📱 Processing DM history export: Using existing channel ${job.channelId}`);
       
@@ -403,6 +459,30 @@ async function processHistoryExportJob(connection, job) {
         };
 
         const dmInfoResponse = await slackRateLimiter.makeRequest(dmInfoRequestFn, `fetch DM info for ${job.channelId}`);
+
+        // Assign dmParticipants based on DM info
+        if (dmInfoResponse.data.ok && dmInfoResponse.data.channel) {
+          if (Array.isArray(dmInfoResponse.data.channel.users)) {
+            dmParticipants = dmInfoResponse.data.channel.users;
+          } else if (dmInfoResponse.data.channel.user) {
+            // 1:1 DM: always include both the other user and the current user
+            dmParticipants = [dmInfoResponse.data.channel.user, connection.slackUserId];
+          }
+        }
+        // Ensure sender is included in dmParticipants
+        if (dmParticipants && dmInfoResponse.data.ok) {
+          if (dmInfoResponse.data.channel && dmInfoResponse.data.channel.user) {
+            if (connection.slackUserId && !dmParticipants.includes(connection.slackUserId)) {
+              dmParticipants.push(connection.slackUserId);
+            }
+          }
+          // Ensure sender is included
+          if (connection.slackUserId && !dmParticipants.includes(connection.slackUserId)) {
+            dmParticipants.push(connection.slackUserId);
+          }
+        }
+        // Remove duplicates just in case
+        dmParticipants = [...new Set(dmParticipants)];
 
         if (dmInfoResponse.data.ok && dmInfoResponse.data.channel.user) {
           const userId = dmInfoResponse.data.channel.user;
@@ -452,7 +532,16 @@ async function processHistoryExportJob(connection, job) {
       }
     } else {
       // For regular channels, get channel info normally
-      channelInfo = await getChannelInfo(connection.accessToken, job.channelId);
+      if (!failedChannelInfoLookups.has(actualChannelId)) {
+        channelInfo = await getChannelInfo(tokenToUse, job.channelId);
+        if (!channelInfo) {
+          // If lookup fails, add to cache to suppress further lookups
+          failedChannelInfoLookups.add(actualChannelId);
+        }
+      } else {
+        // Skip lookup if previously failed
+        channelInfo = null;
+      }
     }
 
     // Update job with channel name if we found it
@@ -461,40 +550,139 @@ async function processHistoryExportJob(connection, job) {
         where: { id: job.id },
         data: { channelName: channelInfo.name }
       });
+    } else {
+      // If channel info is missing, proceed with a fallback name
+      channelInfo = { name: 'Unknown Channel', isPrivate: false };
+      // Optionally update the job with a note
+      await prisma.slackScrapingJob.update({
+        where: { id: job.id },
+        data: { notes: 'Channel info could not be fetched. Proceeding with export using fallback name.' }
+      });
+    }
+
+    // --- Determine time range based on exportRange ---
+    let startTimestamp = 0; // Default to beginning of time
+    let endTimestamp = Math.floor(Date.now() / 1000); // Default to now
+    
+    if (exportRange.type === 'days') {
+      // Last N days
+      const days = parseInt(exportRange.days, 10) || 90;
+      startTimestamp = Math.floor(Date.now() / 1000) - (days * 86400); // 86400 seconds per day
+      console.log(`📅 Exporting messages from last ${days} days (${new Date(startTimestamp * 1000).toISOString()})`);
+      
+    } else if (exportRange.type === 'month') {
+      // Specific month
+      const year = parseInt(exportRange.year, 10) || new Date().getFullYear();
+      const month = parseInt(exportRange.month, 10) || 1;
+      startTimestamp = Math.floor(new Date(year, month - 1, 1).getTime() / 1000);
+      endTimestamp = Math.floor(new Date(year, month, 0, 23, 59, 59).getTime() / 1000);
+      console.log(`📅 Exporting messages for ${year}-${month.toString().padStart(2, '0')} (${new Date(startTimestamp * 1000).toISOString()} to ${new Date(endTimestamp * 1000).toISOString()})`);
+      
+    } else if (exportRange.type === 'year') {
+      // Specific year
+      const year = parseInt(exportRange.year, 10) || new Date().getFullYear();
+      startTimestamp = Math.floor(new Date(year, 0, 1).getTime() / 1000);
+      endTimestamp = Math.floor(new Date(year, 11, 31, 23, 59, 59).getTime() / 1000);
+      console.log(`📅 Exporting messages for ${year} (${new Date(startTimestamp * 1000).toISOString()} to ${new Date(endTimestamp * 1000).toISOString()})`);
+      
+    } else {
+      // Full history (get all years)
+      console.log(`📅 Exporting full message history (all time)`);
     }
 
     // --- YEAR-WISE EXPORT LOGIC START ---
-    const years = await getChannelYearRange(connection.userToken || connection.accessToken, actualChannelId, connection.userToken);
+    // For full history, get all years
+    // For specific time ranges, only get the relevant years
+    let years = [];
+    
+    if (exportRange.type === 'full') {
+      // Full history - get all years
+      years = await getChannelYearRange(tokenToUse, actualChannelId, tokenToUse);
+    } else if (exportRange.type === 'year') {
+      // Specific year only
+      years = [parseInt(exportRange.year, 10)];
+    } else {
+      // For days or month, get the years that overlap with the specified range
+      const startYear = new Date(startTimestamp * 1000).getFullYear();
+      const endYear = new Date(endTimestamp * 1000).getFullYear();
+      for (let year = startYear; year <= endYear; year++) {
+        years.push(year);
+      }
+    }
+    
     if (!years.length) throw new Error('Could not determine year range for channel');
+    
+    console.log(`📅 Processing years: ${years.join(', ')}`);
     totalMessages = 0;
     docsCreated = 0;
     allDocInfos = [];
+    
     for (const year of years) {
+      // For each year, determine start and end timestamps
       let yearStart = Math.floor(new Date(`${year}-01-01T00:00:00Z`).getTime() / 1000);
       let yearEnd = Math.floor(new Date(`${year + 1}-01-01T00:00:00Z`).getTime() / 1000) - 1;
+      
+      // Constrain to the specified time range if applicable
+      if (startTimestamp > yearStart) {
+        yearStart = startTimestamp;
+      }
+      if (endTimestamp < yearEnd) {
+        yearEnd = endTimestamp;
+      }
+      
+      // Skip if the year is completely outside the specified range
+      if (yearEnd < startTimestamp || yearStart > endTimestamp) {
+        console.log(`📅 Skipping year ${year} as it's outside the specified time range`);
+        continue;
+      }
+      
+      console.log(`📅 Processing year ${year} from ${new Date(yearStart * 1000).toISOString()} to ${new Date(yearEnd * 1000).toISOString()}`);
+      
       let hasMore = true;
       let cursor = null;
       let yearMessages = [];
+      
+      // Process messages for this year in batches to optimize memory usage
+      console.log(`🗓️ Processing messages for year ${year}`);
+      
       while (hasMore) {
         const messagesResponse = await fetchChannelMessages(
-          connection.accessToken,
+          tokenToUse,
           actualChannelId,
           cursor,
           batchSize,
-          connection.userToken,
+          tokenToUse, // Always use userToken for message fetching
           yearStart,
           yearEnd
         );
+        
         if (!messagesResponse.ok) throw new Error(messagesResponse.errorMessage || 'Slack API error');
-        const messages = messagesResponse.messages || [];
-        for (const message of messages) {
+        
+        const currentBatch = messagesResponse.messages || [];
+        
+        // Process this batch immediately
+        for (const message of currentBatch) {
           if (message.text) yearMessages.push(message);
-          await saveMessageToDatabase(connection.id, actualChannelId, channelInfo?.name, message);
+          await saveMessageToDatabase(
+            connection.id,
+            actualChannelId,
+            channelInfo?.name,
+            message,
+            job.channelType === 'dm' ? dmParticipants : []
+          );
         }
-        totalMessages += messages.length;
+        
+        totalMessages += currentBatch.length;
         hasMore = messagesResponse.has_more;
         cursor = messagesResponse.response_metadata?.next_cursor;
+        
+        // Help garbage collection by clearing references
+        // but keep yearMessages for doc creation
+        if (hasMore) {
+          console.log(`📊 Processed batch of ${currentBatch.length} messages. More batches pending.`);
+        }
       }
+      
       // Filter messages to only include those from the current year
       yearMessages = yearMessages.filter(msg => {
         const ts = parseFloat(msg.ts);
@@ -506,49 +694,125 @@ async function processHistoryExportJob(connection, job) {
       let messagesWithThreads = 0;
       // We will build a new array with threads flattened
       let flattenedMessages = [];
-      for (let i = 0; i < yearMessages.length; i++) {
-        const msg = yearMessages[i];
-        flattenedMessages.push(msg);
-        if (msg.thread_ts && msg.thread_ts === msg.ts) {
-          // This is a thread parent
-          messagesWithThreads++;
-          const replies = await fetchThreadReplies(
-            connection.accessToken,
-            actualChannelId,
-            msg.thread_ts,
-            connection.userToken
-          );
-          if (replies && replies.length > 0) {
-            threadReplyCount += replies.length;
-            for (const reply of replies) {
-              flattenedMessages.push(reply);
-              await saveMessageToDatabase(connection.id, actualChannelId, channelInfo?.name, reply);
+      // Collect all DB rows for this year (including thread replies)
+      let dbRows = [];
+      
+      // Process thread fetching in batches to optimize memory
+      const threadBatchSize = 50; // Fetch threads for 50 messages at a time
+      
+      for (let i = 0; i < yearMessages.length; i += threadBatchSize) {
+        const messageBatch = yearMessages.slice(i, i + threadBatchSize);
+        console.log(`🧵 Processing thread batch ${Math.floor(i/threadBatchSize) + 1}/${Math.ceil(yearMessages.length/threadBatchSize)}`);
+        
+        for (const msg of messageBatch) {
+          flattenedMessages.push(msg);
+          // For DMs, ensure both DM participants and sender are included, deduplicated
+          let participantsArr = job.channelType === 'dm' ? [...dmParticipants] : [];
+          if (job.channelType === 'dm' && msg.user && !participantsArr.includes(msg.user)) {
+            participantsArr.push(msg.user);
+          }
+          participantsArr = [...new Set(participantsArr)];
+          // Add main message to dbRows
+          dbRows.push({
+            slackConnectionId: connection.id,
+            messageTs: msg.ts,
+            channelId: actualChannelId,
+            channelName: channelInfo?.name,
+            userId: msg.user || '',
+            userName: '', // Will be populated later if needed
+            messageText: msg.text || '',
+            messageType: job.channelType === 'dm' ? 'dm' : 'channel',
+            participants: participantsArr,
+            tags: [],
+            slackSentAt: msg.ts ? new Date(parseFloat(msg.ts) * 1000) : undefined
+          });
+          // Re-enabled: Fetch thread replies for each thread parent
+          if (msg.thread_ts && msg.thread_ts === msg.ts) {
+            // This is a thread parent
+            messagesWithThreads++;
+            const replies = await fetchThreadReplies(
+              tokenToUse,
+              actualChannelId,
+              msg.thread_ts,
+              tokenToUse
+            );
+            if (replies && replies.length > 0) {
+              threadReplyCount += replies.length;
+              for (const reply of replies) {
+                flattenedMessages.push(reply);
+                // For DMs, ensure both DM participants and sender are included, deduplicated
+                let replyParticipantsArr = job.channelType === 'dm' ? [...dmParticipants] : [];
+                if (job.channelType === 'dm' && reply.user && !replyParticipantsArr.includes(reply.user)) {
+                  replyParticipantsArr.push(reply.user);
+                }
+                replyParticipantsArr = [...new Set(replyParticipantsArr)];
+                // Add thread reply to dbRows
+                dbRows.push({
+                  slackConnectionId: connection.id,
+                  messageTs: reply.ts,
+                  channelId: actualChannelId,
+                  channelName: channelInfo?.name,
+                  userId: reply.user || '',
+                  userName: '',
+                  messageText: reply.text || '',
+                  messageType: job.channelType === 'dm' ? 'dm' : 'channel',
+                  participants: replyParticipantsArr,
+                  tags: [],
+                  slackSentAt: reply.ts ? new Date(parseFloat(reply.ts) * 1000) : undefined
+                });
+              }
+              // console.log(`[THREAD] Parent ts ${msg.ts}: fetched ${replies.length} replies`);
             }
-            console.log(`[THREAD] Parent ts ${msg.ts}: fetched ${replies.length} replies`);
           }
         }
+        
+        // Help garbage collection by clearing references to this batch
+        // but keep the accumulated flattenedMessages
+        messageBatch.length = 0;
       }
+      
+      // Release reference to year messages to help with garbage collection
+      yearMessages = null;
+      
       if (messagesWithThreads > 0) {
         console.log(`[THREAD] Year ${year}: ${messagesWithThreads} thread parents, ${threadReplyCount} replies fetched`);
       }
+      
       yearMessages = flattenedMessages;
-      // --- END THREAD REPLIES ---
-
+      
+      // --- BULK INSERT MESSAGES IN CHUNKS ---
+      function chunkArray(array, size) {
+        const result = [];
+        for (let i = 0; i < array.length; i += size) {
+          result.push(array.slice(i, i + size));
+        }
+        return result;
+      }
+      
+      if (dbRows.length > 0) {
+        const chunks = chunkArray(dbRows, 1000);
+        console.log(`📊 Bulk inserting ${dbRows.length} rows in ${chunks.length} chunks`);
+        for (const chunk of chunks) {
+          await prisma.slackConversation.createMany({
+            data: chunk,
+            skipDuplicates: true
+          });
+          
+          // Help garbage collection by clearing references
+          chunk.length = 0;
+        }
+        
+        // Clear database rows after insertion to free memory
+        dbRows = [];
+      }
+      
       // --- DEBUG LOGGING: Check year assignment ---
       const sampleMessages = yearMessages.slice(0, 5).map(msg => {
         const ts = parseFloat(msg.ts);
         const msgYear = new Date(ts * 1000).getFullYear();
         return { ts: msg.ts, year: msgYear, text: msg.text?.slice(0, 40) };
       });
-      console.log(`[DEBUG] Year ${year}: ${yearMessages.length} messages. Sample:`, sampleMessages);
-      // Warn if any message is not in the current year
-      yearMessages.forEach(msg => {
-        const ts = parseFloat(msg.ts);
-        const msgYear = new Date(ts * 1000).getFullYear();
-        if (msgYear !== year) {
-          console.warn(`[WARNING] Message with ts ${msg.ts} (year ${msgYear}) assigned to year ${year}. Text: ${msg.text?.slice(0, 40)}`);
-        }
-      });
+      
       // --- END DEBUG LOGGING ---
 
       // Save to Google Docs for this year
@@ -594,6 +858,10 @@ async function processHistoryExportJob(connection, job) {
           }
         }
       }
+      
+      // Help garbage collection by clearing references
+      yearMessages = null;
+      flattenedMessages = null;
     }
     // --- YEAR-WISE EXPORT LOGIC END ---
 
@@ -692,93 +960,153 @@ async function processHistoryExportJob(connection, job) {
 }
 
 // Helper functions (simplified versions)
+// async function getChannelInfo(accessToken, channelId) {
+//   console.log(`🔍 Getting info for channel ${channelId}...`);
+  
+//   // Method 1: conversations.info (standard)
+//   try {
+//     const response = await slackRateLimiter.makeRequest(async () => {
+//       return await axios.get('https://slack.com/api/conversations.info', {
+//         headers: {
+//           'Authorization': `Bearer ${accessToken}`,
+//           'Content-Type': 'application/json'
+//         },
+//         params: { channel: channelId }
+//       });
+//     }, `conversations.info for ${channelId}`);
+    
+//     if (response.data.ok) {
+//       console.log(`✅ conversations.info: SUCCESS for ${channelId}`);
+//       return {
+//         name: response.data.channel.name,
+//         isPrivate: response.data.channel.is_private,
+//         isMember: response.data.channel.is_member
+//       };
+//     } else {
+//       console.log(`❌ conversations.info: ${response.data.error} for ${channelId}`);
+//     }
+//   } catch (error) {
+//     console.log(`❌ conversations.info error: ${error.message} for ${channelId}`);
+//   }
+  
+//   // Method 2: Try channels.info (for public channels)
+//   if (channelId.startsWith('C')) {
+//     console.log(`🔄 Trying channels.info as fallback for ${channelId}...`);
+//     try {
+//       const channelsResponse = await slackRateLimiter.makeRequest(async () => {
+//         return await axios.get('https://slack.com/api/channels.info', {
+//           headers: {
+//             'Authorization': `Bearer ${accessToken}`,
+//             'Content-Type': 'application/json'
+//           },
+//           params: { channel: channelId }
+//         });
+//       }, `channels.info for ${channelId}`);
+      
+//       if (channelsResponse.data.ok) {
+//         console.log(`✅ channels.info: SUCCESS for ${channelId}`);
+//         return {
+//           name: channelsResponse.data.channel.name,
+//           isPrivate: false, // Public channel
+//           isMember: channelsResponse.data.channel.is_member
+//         };
+//       } else {
+//         console.log(`❌ channels.info: ${channelsResponse.data.error} for ${channelId}`);
+//       }
+//     } catch (error) {
+//       console.log(`❌ channels.info error: ${error.message} for ${channelId}`);
+//     }
+//   }
+  
+//   // Method 3: Try groups.info (for private channels)
+//   if (channelId.startsWith('G')) {
+//     console.log(`🔄 Trying groups.info as fallback for ${channelId}...`);
+//     try {
+//       const groupsResponse = await slackRateLimiter.makeRequest(async () => {
+//         return await axios.get('https://slack.com/api/groups.info', {
+//           headers: {
+//             'Authorization': `Bearer ${accessToken}`,
+//             'Content-Type': 'application/json'
+//           },
+//           params: { channel: channelId }
+//         });
+//       }, `groups.info for ${channelId}`);
+      
+//       if (groupsResponse.data.ok) {
+//         console.log(`✅ groups.info: SUCCESS for ${channelId}`);
+//         return {
+//           name: groupsResponse.data.group.name,
+//           isPrivate: true, // Private channel
+//           isMember: groupsResponse.data.group.is_member
+//         };
+//       } else {
+//         console.log(`❌ groups.info: ${groupsResponse.data.error} for ${channelId}`);
+//       }
+//     } catch (error) {
+//       console.log(`❌ groups.info error: ${error.message} for ${channelId}`);
+//     }
+//   }
+  
+//   console.log(`❌ Could not get info for channel ${channelId} using any method`);
+//   return null;
+// }
+
+
 async function getChannelInfo(accessToken, channelId) {
   console.log(`🔍 Getting info for channel ${channelId}...`);
-  
-  // Method 1: conversations.info (standard)
-  try {
-    const response = await slackRateLimiter.makeRequest(async () => {
-      return await axios.get('https://slack.com/api/conversations.info', {
-        headers: {
-          'Authorization': `Bearer ${accessToken}`,
-          'Content-Type': 'application/json'
-        },
-        params: { channel: channelId }
-      });
-    }, `conversations.info for ${channelId}`);
-    
-    if (response.data.ok) {
-      console.log(`✅ conversations.info: SUCCESS for ${channelId}`);
-      return {
-        name: response.data.channel.name,
-        isPrivate: response.data.channel.is_private,
-        isMember: response.data.channel.is_member
-      };
-    } else {
-      console.log(`❌ conversations.info: ${response.data.error} for ${channelId}`);
+
+  // Use only conversations.info for all channel types (public, private, shared, etc.)
+  // Optionally keep groups.info for legacy private groups
+  const endpoints = [
+    {
+      name: 'conversations.info',
+      url: 'https://slack.com/api/conversations.info',
+      type: 'generic'
+    },
+    // Optionally keep groups.info for legacy private groups
+    {
+      name: 'groups.info',
+      url: 'https://slack.com/api/groups.info',
+      type: 'private',
+      condition: () => channelId.startsWith('G')
     }
-  } catch (error) {
-    console.log(`❌ conversations.info error: ${error.message} for ${channelId}`);
-  }
-  
-  // Method 2: Try channels.info (for public channels)
-  if (channelId.startsWith('C')) {
-    console.log(`🔄 Trying channels.info as fallback for ${channelId}...`);
+  ];
+
+  for (const endpoint of endpoints) {
+    if (endpoint.condition && !endpoint.condition()) continue;
+
+    console.log(`⚙️ Attempting ${endpoint.name} for ${channelId}...`);
+
     try {
-      const channelsResponse = await slackRateLimiter.makeRequest(async () => {
-        return await axios.get('https://slack.com/api/channels.info', {
+      const response = await slackRateLimiter.makeRequest(() => {
+        return axios.get(endpoint.url, {
           headers: {
-            'Authorization': `Bearer ${accessToken}`,
+            Authorization: `Bearer ${accessToken}`,
             'Content-Type': 'application/json'
           },
           params: { channel: channelId }
         });
-      }, `channels.info for ${channelId}`);
-      
-      if (channelsResponse.data.ok) {
-        console.log(`✅ channels.info: SUCCESS for ${channelId}`);
+      }, `${endpoint.name} for ${channelId}`);
+
+      // console.log('response', response);
+
+      if (response.data.ok) {
+        const data = response.data.channel || response.data.group;
+        console.log(`✅ ${endpoint.name}: SUCCESS for ${channelId}`);
         return {
-          name: channelsResponse.data.channel.name,
-          isPrivate: false, // Public channel
-          isMember: channelsResponse.data.channel.is_member
+          name: data.name,
+          isPrivate: endpoint.type === 'private' || data.is_private || false,
+          isMember: data.is_member,
+          source: endpoint.name
         };
       } else {
-        console.log(`❌ channels.info: ${channelsResponse.data.error} for ${channelId}`);
+        console.log(`❌ ${endpoint.name}: ${response.data.error} for ${channelId}`);
       }
     } catch (error) {
-      console.log(`❌ channels.info error: ${error.message} for ${channelId}`);
+      console.log(`❌ ${endpoint.name} error: ${error.message} for ${channelId}`);
     }
   }
-  
-  // Method 3: Try groups.info (for private channels)
-  if (channelId.startsWith('G')) {
-    console.log(`🔄 Trying groups.info as fallback for ${channelId}...`);
-    try {
-      const groupsResponse = await slackRateLimiter.makeRequest(async () => {
-        return await axios.get('https://slack.com/api/groups.info', {
-          headers: {
-            'Authorization': `Bearer ${accessToken}`,
-            'Content-Type': 'application/json'
-          },
-          params: { channel: channelId }
-        });
-      }, `groups.info for ${channelId}`);
-      
-      if (groupsResponse.data.ok) {
-        console.log(`✅ groups.info: SUCCESS for ${channelId}`);
-        return {
-          name: groupsResponse.data.group.name,
-          isPrivate: true, // Private channel
-          isMember: groupsResponse.data.group.is_member
-        };
-      } else {
-        console.log(`❌ groups.info: ${groupsResponse.data.error} for ${channelId}`);
-      }
-    } catch (error) {
-      console.log(`❌ groups.info error: ${error.message} for ${channelId}`);
-    }
-  }
-  
+
   console.log(`❌ Could not get info for channel ${channelId} using any method`);
   return null;
 }
@@ -810,57 +1138,52 @@ async function verifyTokenScopes(token, channelId) {
     console.log(`✅ Token identity verified: ${authResponse.data.user} (${authResponse.data.user_id}) on team ${authResponse.data.team} (${authResponse.data.team_id})`);
     
     // Next, check token scopes
-    const scopesRequestFn = async () => {
-      return await axios.get('https://slack.com/api/apps.auth.test', {
-        headers: {
-          'Authorization': `Bearer ${token}`,
-          'Content-Type': 'application/json'
-        }
-      });
-    };
+    // const scopesRequestFn = async () => {
+    //   return await axios.get('https://slack.com/api/apps.auth.test', {
+    //     headers: {
+    //       'Authorization': `Bearer ${token}`,
+    //       'Content-Type': 'application/json'
+    //     }
+    //   });
+    // };
     
-    try {
-      console.log(`🔍 Checking token scopes...`);
-      const scopesResponse = await slackRateLimiter.makeRequest(scopesRequestFn, 'check token scopes');
+    // try {
+    //   console.log(`🔍 Checking token scopes...`);
+    //   const scopesResponse = await slackRateLimiter.makeRequest(scopesRequestFn, 'check token scopes');
       
-      if (scopesResponse.data.ok) {
-        const scopes = scopesResponse.data.scopes || [];
-        console.log(`📋 Token has the following scopes: ${scopes.join(', ')}`);
+    //   if (scopesResponse.data.ok) {
+    //     const scopes = scopesResponse.data.scopes || [];
+    //     console.log(`📋 Token has the following scopes: ${scopes.join(', ')}`);
         
-        // Determine required scope based on channel type
-        let requiredScope = 'channels:history';
-        if (channelId.startsWith('G')) {
-          requiredScope = 'groups:history';
-        } else if (channelId.startsWith('D')) {
-          requiredScope = 'im:history';
-        }
+    //     // Determine required scope based on channel type
+    //     let requiredScope = getRequiredScope(channelId);
         
-        // Check if the required scope is present
-        const hasRequiredScope = scopes.includes(requiredScope);
-        console.log(`🔐 Required scope for channel ${channelId}: ${requiredScope} - Present: ${hasRequiredScope}`);
+    //     // Check if the required scope is present
+    //     const hasRequiredScope = scopes.includes(requiredScope);
+    //     console.log(`🔐 Required scope for channel ${channelId}: ${requiredScope} - Present: ${hasRequiredScope}`);
         
-        if (!hasRequiredScope) {
-          return {
-            ok: false,
-            error: 'missing_scope',
-            errorMessage: `Token is missing required scope: ${requiredScope}. Current scopes: ${scopes.join(', ')}`,
-            requiredScope,
-            currentScopes: scopes
-          };
-        }
+    //     if (!hasRequiredScope) {
+    //       return {
+    //         ok: false,
+    //         error: 'missing_scope',
+    //         errorMessage: `Token is missing required scope: ${requiredScope}. Current scopes: ${scopes.join(', ')}`,
+    //         requiredScope,
+    //         currentScopes: scopes
+    //       };
+    //     }
         
-        return {
-          ok: true,
-          tokenInfo: authResponse.data,
-          requiredScope,
-          scopes
-        };
-      } else {
-        console.log(`⚠️ Could not verify token scopes: ${scopesResponse.data.error}`);
-      }
-    } catch (scopesError) {
-      console.log(`⚠️ Error checking token scopes: ${scopesError.message}`);
-    }
+    //     return {
+    //       ok: true,
+    //       tokenInfo: authResponse.data,
+    //       requiredScope,
+    //       scopes
+    //     };
+    //   } else {
+    //     console.log(`⚠️ Could not verify token scopes: ${scopesResponse.data.error}`);
+    //   }
+    // } catch (scopesError) {
+    //   console.log(`⚠️ Error checking token scopes: ${scopesError.message}`);
+    // }
     
     // If we couldn't check scopes directly, try a test request to the channel
     console.log(`🔍 Performing test request to channel ${channelId}...`);
@@ -887,12 +1210,7 @@ async function verifyTokenScopes(token, channelId) {
       console.log(`✅ Test request successful for channel ${channelId}`);
       
       // Determine required scope based on channel type
-      let requiredScope = 'channels:history';
-      if (channelId.startsWith('G')) {
-        requiredScope = 'groups:history';
-      } else if (channelId.startsWith('D')) {
-        requiredScope = 'im:history';
-      }
+      let requiredScope = getRequiredScope(channelId);
       
       return {
         ok: true,
@@ -947,80 +1265,85 @@ async function verifyTokenScopes(token, channelId) {
   }
 }
 
+// Global cache for users map by teamId
+const usersMapCache = new Map();
+
 async function getUsersMap(userToken, teamId) {
+  // Use cache if available
+  if (usersMapCache.has(teamId)) {
+    return usersMapCache.get(teamId);
+  }
   const usersMap = new Map();
-  
   try {
-    const requestFn = async () => {
-      return await axios.get('https://slack.com/api/users.list', {
+    let cursor = null;
+    do {
+      const response = await axios.get('https://slack.com/api/users.list', {
         headers: {
           'Authorization': `Bearer ${userToken}`,
           'Content-Type': 'application/json'
-        }
+        },
+        params: cursor ? { cursor } : {}
       });
-    };
-
-    const response = await slackRateLimiter.makeRequest(requestFn, 'fetch users list');
-    
-    if (response.data.ok) {
-      response.data.members.forEach(user => {
-        usersMap.set(user.id, user);
-      });
-    }
+      if (response.data.ok) {
+        response.data.members.forEach(user => {
+          usersMap.set(user.id, user);
+        });
+        cursor = response.data.response_metadata?.next_cursor;
+      } else {
+        cursor = null;
+      }
+    } while (cursor);
+    usersMapCache.set(teamId, usersMap);
   } catch (error) {
     console.error('Error fetching users:', error.message);
   }
-  
+
+  // Patch: Add a direct lookup method to the map for missing users
+  usersMap.directLookup = async function(userId) {
+    if (this.has(userId)) return this.get(userId);
+    try {
+      const response = await axios.get('https://slack.com/api/users.info', {
+        headers: {
+          'Authorization': `Bearer ${userToken}`,
+          'Content-Type': 'application/json'
+        },
+        params: { user: userId }
+      });
+      if (response.data.ok && response.data.user) {
+        this.set(userId, response.data.user);
+        // Also update the global cache
+        if (usersMapCache.has(teamId)) {
+          usersMapCache.get(teamId).set(userId, response.data.user);
+        }
+        return response.data.user;
+      }
+    } catch (error) {
+      console.error(`Direct user lookup failed for ${userId}:`, error.message);
+    }
+    return null;
+  };
+
   return usersMap;
 }
 
-async function fetchChannelMessages(accessToken, channelId, cursor = null, limit = 100, userToken = null, oldest = null, latest = null) {
-  // Determine which token to use based on channel type and available tokens
-  let token = accessToken; // Default to bot token
+// Helper to select Slack token and log usage
+function getSlackToken(channelId, userToken, accessToken, context = '') {
+  let token = accessToken;
   let tokenType = 'Bot Token';
-  
-  // ALWAYS use user token if available, regardless of channel type
   if (userToken) {
     token = userToken;
     tokenType = 'User Token';
-    console.log(`🔄 Using User Token for ${channelId} (preferred over bot token)`);
+    // console.log(`🔄 Using User Token for ${channelId}${context ? ' (' + context + ')' : ''} (preferred over bot token)`);
   } else {
-    console.log(`⚠️ No User Token available, falling back to Bot Token for ${channelId}`);
+    console.log(`⚠️ No User Token available, falling back to Bot Token for ${channelId}${context ? ' (' + context + ')' : ''}`);
   }
+  return { token, tokenType };
+}
 
-  // For DMs, use a smaller batch size to avoid rate limits
-  if (channelId.startsWith('D')) {
-    const originalLimit = limit;
-    limit = Math.min(limit, 50); // Cap at 50 for DMs
-    if (originalLimit !== limit) {
-      console.log(`⚠️ Reducing batch size for DM from ${originalLimit} to ${limit} to avoid rate limits`);
-    }
-  }
-  
-  // Try multiple API methods for better success rate
-  console.log(`🔄 Fetching messages from ${channelId} using ${tokenType}...`);
-  
-  // Method 1: conversations.history (standard)
+// Helper to fetch Slack history with fallback across multiple endpoints
+async function fetchSlackHistoryWithFallback({ token, channelId, params, slackRateLimiter }) {
+  // Try conversations.history first
   try {
-    // Note: As of May 29, 2025 for non-Marketplace apps, this method will be 
-    // rate limited to 1 request per minute with max limit of 15 objects
-    const params = {
-      channel: channelId,
-      // limit: limit,
-      limit: 1000,
-      oldest: oldest ? oldest.toString() : "0",
-      latest: latest ? latest.toString() : "0",
-      // Optional parameters that could be used:
-      // oldest: timestamp - start of time range
-      // latest: timestamp - end of time range
-      // inclusive: boolean - include messages with timestamps matching oldest/latest
-      // include_all_metadata: boolean - include all metadata about messages
-    };
-    
-    if (cursor) {
-      params.cursor = cursor;
-    }
-    
     const response = await slackRateLimiter.makeRequest(async () => {
       return await axios.get('https://slack.com/api/conversations.history', {
         headers: {
@@ -1030,217 +1353,141 @@ async function fetchChannelMessages(accessToken, channelId, cursor = null, limit
         params
       });
     }, `conversations.history for ${channelId}`);
-    
     if (response.data.ok) {
-      console.log(`✅ conversations.history: SUCCESS for ${channelId}`);
-      
-      // Add debug info about what Slack actually returned
-      console.log(`📊 Slack response details: Requested ${limit} messages, got ${response.data.messages.length}`);
-      console.log(`📊 Response has_more: ${response.data.has_more}, is_limited: ${response.data.is_limited || false}`);
-      
-      // Check if there are any rate limit headers
-      const rateHeaders = {};
-      if (response.headers) {
-        ['x-rate-limit-limit', 'x-rate-limit-remaining', 'x-rate-limit-reset', 'retry-after'].forEach(header => {
-          if (response.headers[header]) {
-            rateHeaders[header] = response.headers[header];
-          }
-        });
-        
-        if (Object.keys(rateHeaders).length > 0) {
-          console.log(`📊 Rate limit headers:`, rateHeaders);
-        }
-      }
-      
-      return {
-        ok: true,
-        messages: response.data.messages,
-        has_more: response.data.has_more,
-        response_metadata: response.data.response_metadata
-      };
+      return { ok: true, messages: response.data.messages, has_more: response.data.has_more, response_metadata: response.data.response_metadata };
     } else {
-      console.log(`❌ conversations.history: ${response.data.error} for ${channelId}`);
-      
-      // If first attempt with user token fails, try bot token as fallback for public channels
-      if (tokenType === 'User Token' && response.data.error && accessToken && token !== accessToken && channelId.startsWith('C')) {
-        console.log(`⚠️ User Token failed with error: ${response.data.error}. Trying Bot Token as fallback...`);
-        
-        // Try again with bot token
-        const fallbackResponse = await slackRateLimiter.makeRequest(async () => {
-          return await axios.get('https://slack.com/api/conversations.history', {
-            headers: {
-              'Authorization': `Bearer ${accessToken}`,
-              'Content-Type': 'application/json'
-            },
-            params
-          });
-        }, `fallback conversations.history for ${channelId}`);
-        
-        if (fallbackResponse.data.ok) {
-          console.log(`✅ Bot Token fallback successful for ${channelId}`);
-          return {
-            ok: true,
-            messages: fallbackResponse.data.messages,
-            has_more: fallbackResponse.data.has_more,
-            response_metadata: fallbackResponse.data.response_metadata
-          };
-        }
-        
-        console.log(`❌ Bot Token fallback also failed: ${fallbackResponse.data.error} for ${channelId}`);
+      // Only try fallback if error is not a fatal auth error
+      if (response.data.error !== 'invalid_auth' && response.data.error !== 'account_inactive') {
+        // Continue to fallbacks
+      } else {
+        return { ok: false, error: response.data.error, errorMessage: response.data.error };
       }
-      
-      // Method 2: Try channels.history (for public channels)
-      if (channelId.startsWith('C')) {
-        console.log(`🔄 Trying channels.history as fallback for ${channelId}...`);
-        try {
-          const channelsResponse = await slackRateLimiter.makeRequest(async () => {
-            return await axios.get('https://slack.com/api/channels.history', {
-              headers: {
-                'Authorization': `Bearer ${token}`,
-                'Content-Type': 'application/json'
-              },
-              params
-            });
-          }, `channels.history for ${channelId}`);
-          
-          if (channelsResponse.data.ok) {
-            console.log(`✅ channels.history: SUCCESS for ${channelId}`);
-            return {
-              ok: true,
-              messages: channelsResponse.data.messages,
-              has_more: channelsResponse.data.has_more,
-              response_metadata: channelsResponse.data.response_metadata
-            };
-          } else {
-            console.log(`❌ channels.history: ${channelsResponse.data.error} for ${channelId}`);
-          }
-        } catch (error) {
-          console.log(`❌ channels.history error: ${error.message} for ${channelId}`);
-        }
+    }
+  } catch (e) {
+    // Continue to fallbacks
+  }
+  // Fallbacks by channel type
+  // Even though user tokens are preferred, we try bot token endpoints as a fallback for public channels.
+  // This is because the bot may have access to public channels that the user does not, or if the user token is missing/invalid.
+  if (channelId.startsWith('C')) {
+    // Try channels.history (bot token fallback for public channels)
+    try {
+      const channelsResponse = await slackRateLimiter.makeRequest(async () => {
+        return await axios.get('https://slack.com/api/channels.history', {
+          headers: {
+            'Authorization': `Bearer ${token}`,
+            'Content-Type': 'application/json'
+          },
+          params
+        });
+      }, `channels.history for ${channelId}`);
+      if (channelsResponse.data.ok) {
+        return { ok: true, messages: channelsResponse.data.messages, has_more: channelsResponse.data.has_more, response_metadata: channelsResponse.data.response_metadata };
       }
-      
-      // Method 3: Try groups.history (for private channels)
-      if (channelId.startsWith('G')) {
-        console.log(`🔄 Trying groups.history as fallback for ${channelId}...`);
-        try {
-          const groupsResponse = await slackRateLimiter.makeRequest(async () => {
-            return await axios.get('https://slack.com/api/groups.history', {
-              headers: {
-                'Authorization': `Bearer ${token}`,
-                'Content-Type': 'application/json'
-              },
-              params
-            });
-          }, `groups.history for ${channelId}`);
-          
-          if (groupsResponse.data.ok) {
-            console.log(`✅ groups.history: SUCCESS for ${channelId}`);
-            return {
-              ok: true,
-              messages: groupsResponse.data.messages,
-              has_more: groupsResponse.data.has_more,
-              response_metadata: groupsResponse.data.response_metadata
-            };
-          } else {
-            console.log(`❌ groups.history: ${groupsResponse.data.error} for ${channelId}`);
-          }
-        } catch (error) {
-          console.log(`❌ groups.history error: ${error.message} for ${channelId}`);
-        }
+    } catch (e) {}
+  }
+  if (channelId.startsWith('G')) {
+    // Try groups.history (bot token fallback for private groups)
+    try {
+      const groupsResponse = await slackRateLimiter.makeRequest(async () => {
+        return await axios.get('https://slack.com/api/groups.history', {
+          headers: {
+            'Authorization': `Bearer ${token}`,
+            'Content-Type': 'application/json'
+          },
+          params
+        });
+      }, `groups.history for ${channelId}`);
+      if (groupsResponse.data.ok) {
+        return { ok: true, messages: groupsResponse.data.messages, has_more: groupsResponse.data.has_more, response_metadata: groupsResponse.data.response_metadata };
       }
-      
-      // Method 4: Try im.history (for DMs)
-      if (channelId.startsWith('D')) {
-        console.log(`🔄 Trying im.history as fallback for ${channelId}...`);
-        try {
-          const imResponse = await slackRateLimiter.makeRequest(async () => {
-            return await axios.get('https://slack.com/api/im.history', {
-              headers: {
-                'Authorization': `Bearer ${token}`,
-                'Content-Type': 'application/json'
-              },
-              params
-            });
-          }, `im.history for ${channelId}`);
-          
-          if (imResponse.data.ok) {
-            console.log(`✅ im.history: SUCCESS for ${channelId}`);
-            return {
-              ok: true,
-              messages: imResponse.data.messages,
-              has_more: imResponse.data.has_more,
-              response_metadata: imResponse.data.response_metadata
-            };
-          } else {
-            console.log(`❌ im.history: ${imResponse.data.error} for ${channelId}`);
-          }
-        } catch (error) {
-          console.log(`❌ im.history error: ${error.message} for ${channelId}`);
-        }
+    } catch (e) {}
+  }
+  if (channelId.startsWith('D')) {
+    // Try im.history (bot token fallback for DMs, though usually not available)
+    try {
+      const imResponse = await slackRateLimiter.makeRequest(async () => {
+        return await axios.get('https://slack.com/api/im.history', {
+          headers: {
+            'Authorization': `Bearer ${token}`,
+            'Content-Type': 'application/json'
+          },
+          params
+        });
+      }, `im.history for ${channelId}`);
+      if (imResponse.data.ok) {
+        return { ok: true, messages: imResponse.data.messages, has_more: imResponse.data.has_more, response_metadata: imResponse.data.response_metadata };
       }
-      
-      // Handle specific error cases if all methods failed
-      const error = response.data.error;
-      if (error === 'not_in_channel') {
-        console.log(`⚠️ ${tokenType} not in channel ${channelId}. This channel requires the user or bot to be a member.`);
-        return {
-          ok: false,
-          error: 'not_in_channel',
-          errorMessage: `${tokenType} needs to be invited to channel ${channelId}. Please invite the user or bot to this channel in Slack.`
-        };
-      } else if (error === 'channel_not_found') {
-        console.log(`⚠️ Channel ${channelId} not found or token doesn't have access.`);
-        return {
-          ok: false,
-          error: 'channel_not_found',
-          errorMessage: `Channel ${channelId} not found or token doesn't have access.`
-        };
-      } else if (error === 'missing_scope') {
-        const requiredScopes = channelId.startsWith('C') ? 'channels:history' : 
-                             channelId.startsWith('G') ? 'groups:history' : 
-                             channelId.startsWith('D') ? 'im:history' : 'channels:history';
-        
-        console.log(`⚠️ Missing required scope for channel ${channelId}. Required scope: ${requiredScopes}`);
-        
-        // Provide detailed error message with token type
-        return {
-          ok: false,
-          error: 'missing_scope',
-          errorMessage: `${tokenType} is missing required scope for channel ${channelId}. Please ensure the ${tokenType === 'Bot Token' ? 'Slack app' : 'user'} has the '${requiredScopes}' scope. For private channels and DMs, user token with appropriate scopes may be required.`
-        };
-      }
-      
+    } catch (e) {}
+  }
+  // If all fail, return a generic error
+  return { ok: false, error: 'slack_api_error', errorMessage: 'All Slack history endpoints failed for this channel.' };
+}
+
+// In fetchChannelMessages, replace the repeated fallback logic with a call to fetchSlackHistoryWithFallback
+async function fetchChannelMessages(accessToken, channelId, cursor = null, limit = 100, userToken = null, oldest = null, latest = null) {
+  const { token, tokenType } = getSlackToken(channelId, userToken, accessToken);
+  if (channelId.startsWith('D')) {
+    const originalLimit = limit;
+    limit = Math.min(limit, 50);
+    if (originalLimit !== limit) {
+      console.log(`⚠️ Reducing batch size for DM from ${originalLimit} to ${limit} to avoid rate limits`);
+    }
+  }
+  console.log(`🔄 Fetching messages from ${channelId} using ${tokenType}...`);
+  // Prepare params
+  const params = {
+    channel: channelId,
+    limit: 1000,
+    oldest: oldest ? oldest.toString() : "0",
+    latest: latest ? latest.toString() : "0"
+  };
+  if (cursor) params.cursor = cursor;
+  // Use the new helper for all fallbacks
+  const result = await fetchSlackHistoryWithFallback({ token, channelId, params, slackRateLimiter });
+  if (result.ok) {
+    // Add debug info about what Slack actually returned
+    console.log(`📊 Slack response details: Requested ${limit} messages, got ${result.messages.length}`);
+    console.log(`📊 Response has_more: ${result.has_more}, is_limited: ${result.is_limited || false}`);
+    return result;
+  } else {
+    // Handle specific error cases if all methods failed
+    if (result.error === 'not_in_channel') {
+      console.log(`⚠️ ${tokenType} not in channel ${channelId}. This channel requires the user or bot to be a member.`);
       return {
         ok: false,
-        error: error,
-        errorMessage: `Slack API error: ${error}`
+        error: 'not_in_channel',
+        errorMessage: `${tokenType} needs to be invited to channel ${channelId}. Please invite the user or bot to this channel in Slack.`
+      };
+    } else if (result.error === 'channel_not_found') {
+      console.log(`⚠️ Channel ${channelId} not found or token doesn't have access.`);
+      return {
+        ok: false,
+        error: 'channel_not_found',
+        errorMessage: `Channel ${channelId} not found or token doesn't have access.`
+      };
+    } else if (result.error === 'missing_scope') {
+      const requiredScopes = getRequiredScope(channelId);
+      console.log(`⚠️ Missing required scope for channel ${channelId}. Required scope: ${requiredScopes}`);
+      return {
+        ok: false,
+        error: 'missing_scope',
+        errorMessage: `${tokenType} is missing required scope for channel ${channelId}. Please ensure the ${tokenType === 'Bot Token' ? 'Slack app' : 'user'} has the '${requiredScopes}' scope. For private channels and DMs, user token with appropriate scopes may be required.`
       };
     }
-  } catch (error) {
-    console.error(`❌ Error fetching messages for ${channelId}:`, error.message);
     return {
       ok: false,
-      error: 'api_error',
-      errorMessage: `API Error: ${error.message}`
+      error: result.error,
+      errorMessage: `Slack API error: ${result.errorMessage}`
     };
   }
 }
 
 async function fetchThreadReplies(accessToken, channelId, threadTs, userToken = null) {
-  // Determine which token to use based on channel type and available tokens
-  let token = accessToken; // Default to bot token
-  let tokenType = 'Bot Token';
-  
-  // ALWAYS use user token if available, regardless of channel type
-  if (userToken) {
-    token = userToken;
-    tokenType = 'User Token';
-    console.log(`🔄 Using User Token for thread ${threadTs} in ${channelId} (preferred over bot token)`);
-  } else {
-    console.log(`⚠️ No User Token available, falling back to Bot Token for thread ${threadTs} in ${channelId}`);
-  }
+  // Use helper to select token
+  const { token, tokenType } = getSlackToken(channelId, userToken, accessToken, `thread ${threadTs}`);
 
-  console.log(`🧵 Fetching thread replies for ${threadTs} in ${channelId} using ${tokenType}...`);
+  // console.log(`🧵 Fetching thread replies for ${threadTs} in ${channelId} using ${tokenType}...`);
   
   // Method 1: conversations.replies (standard)
   try {
@@ -1258,7 +1505,8 @@ async function fetchThreadReplies(accessToken, channelId, threadTs, userToken = 
     }, `conversations.replies for ${threadTs}`);
     
     if (response.data.ok) {
-      console.log(`✅ conversations.replies: SUCCESS for thread ${threadTs} (${response.data.messages.length - 1} replies)`);
+      // Only log a concise summary for each thread
+      // console.log(`[THREAD] Parent ts ${threadTs}: ${response.data.messages.length - 1} replies fetched`); // Removed duplicate log
       return response.data.messages.slice(1); // Skip the first message (parent)
     } else {
       console.log(`❌ conversations.replies: ${response.data.error} for thread ${threadTs}`);
@@ -1297,7 +1545,7 @@ async function fetchThreadReplies(accessToken, channelId, threadTs, userToken = 
   return [];
 }
 
-async function saveMessageToDatabase(connectionId, channelId, channelName, message) {
+async function saveMessageToDatabase(connectionId, channelId, channelName, message, participants) {
   try {
     let finalChannelName = channelName;
     if (!finalChannelName || finalChannelName === 'Unknown') {
@@ -1332,7 +1580,7 @@ async function saveMessageToDatabase(connectionId, channelId, channelName, messa
         userName: '', // Will be populated later if needed
         messageText: message.text || '',
         messageType: channelId.startsWith('D') ? 'dm' : 'channel',
-        participants: [],
+        participants: participants || [],
         tags: [],
         slackSentAt: message.ts ? new Date(parseFloat(message.ts) * 1000) : undefined
       }
@@ -1418,32 +1666,41 @@ async function saveMessagesToGoogleDocs(connectionId, channelId, channelName, me
       console.log(`[DEBUG] Found existing document for ${documentName}_Part1: ${docId}`);
     }
 
-    // Get users map for resolving user IDs to names
+    // Get users map for resolving user IDs to names - process in batches to optimize memory
     const usersMap = await getUsersMap(connection.userToken || connection.accessToken, connection.slackTeamId);
     console.log(`[DEBUG] usersMap size: ${usersMap.size}`);
 
-    // Group messages by user for DMs
+    // Process messages in memory-efficient batches
+    const batchSize = 500; // Process 500 messages at a time for formatting
     let formattedContent = '';
-    if (messageType === 'dm' || messageType === 'channel' || messageType === 'group') {
-      // Interleaved: latest on top, oldest on bottom
-      for (const msg of messages.slice().reverse()) {
-        let username = 'Unknown User';
-        if (msg.user_profile?.display_name || msg.user_profile?.real_name) {
-          username = msg.user_profile?.display_name || msg.user_profile?.real_name;
-        } else if (msg.username) {
-          username = msg.username;
-        } else if (msg.user && usersMap.has(msg.user)) {
-          const userInfo = usersMap.get(msg.user);
-          username = userInfo.display_name || userInfo.real_name || userInfo.name || msg.user;
-        } else if (msg.user) {
-          username = msg.user;
+    
+    // Process in batches to avoid memory issues with large message sets
+    for (let i = 0; i < messages.length; i += batchSize) {
+      const batch = messages.slice(i, i + batchSize);
+      console.log(`[DEBUG] Formatting batch ${Math.floor(i/batchSize) + 1}/${Math.ceil(messages.length/batchSize)}: ${batch.length} messages`);
+      
+      // Group messages by user for DMs
+      if (messageType === 'dm' || messageType === 'channel' || messageType === 'group') {
+        // Interleaved: latest on top, oldest on bottom
+        for (const msg of batch.slice().reverse()) {
+          let username = getDisplayName(
+            msg.user_profile ||
+            (msg.user && usersMap.has(msg.user) ? usersMap.get(msg.user) : null) ||
+            msg.username ||
+            msg.user,
+            'Unknown User'
+          );
+          const date = new Date(parseFloat(msg.ts) * 1000);
+          const cleanText = replaceSlackMentions(msg.text, usersMap);
+          formattedContent += `${username}: ${cleanText}\n\n`;
         }
-        const date = new Date(parseFloat(msg.ts) * 1000);
-        const cleanText = replaceSlackMentions(msg.text, usersMap);
-        formattedContent += `[${date.toLocaleString()}] ${username}: ${cleanText}\n\n`;
       }
-      console.log(`[DEBUG] formattedContent length: ${formattedContent.length}`);
+      
+      // Help garbage collection by clearing references to this batch
+      batch.length = 0;
     }
+    
+    console.log(`[DEBUG] Total formattedContent length: ${formattedContent.length}`);
 
     // Check if content is too large and needs to be split into multiple documents
     const maxDocumentSize = 800 * 1024; // 800KB per document (safer limit)
@@ -1452,6 +1709,10 @@ async function saveMessagesToGoogleDocs(connectionId, channelId, channelName, me
     if (contentBytes > maxDocumentSize) {
       console.log(`[DEBUG] Content too large, calling createMultipleDocuments`);
       const docs = await createMultipleDocuments(documentName, formattedContent, targetFolderId, messageType);
+      
+      // Clear the large content string to free memory
+      formattedContent = '';
+      
       return docs; // Always return array
     }
 
@@ -1487,6 +1748,10 @@ async function saveMessagesToGoogleDocs(connectionId, channelId, channelName, me
         ]
       }
     });
+    
+    // Clear the content string to free memory
+    formattedContent = '';
+    
     const docUrl = `https://docs.google.com/document/d/${docId}`;
     console.log(`[DEBUG] Document ready: ${docUrl}`);
     return [{
@@ -1534,13 +1799,23 @@ async function createMultipleDocuments(documentName, formattedContent, targetFol
       });
       const docId = createResponse.data.id;
       // Add content
+      // Fetch document to get endIndex
+      let endIndex = 1;
+      try {
+        const document = await docs.documents.get({ documentId: docId });
+        if (document && document.data && document.data.body) {
+          endIndex = document.data.body.content[document.data.body.content.length - 1].endIndex || 1;
+        }
+      } catch (error) {
+        // fallback to 1
+      }
       await docs.documents.batchUpdate({
         documentId: docId,
         requestBody: {
           requests: [
             {
               insertText: {
-                location: { index: 1 },
+                location: { index: Math.max(1, endIndex - 1) },
                 text: headerContent + contentParts[i]
               }
             }
@@ -1695,7 +1970,6 @@ async function checkTokenValidity(connection, job) {
   
   // Always try user token first if available (PREFERRED)
   if (hasUserToken) {
-    console.log(`🔍 Checking user token validity (PREFERRED)...`);
     try {
       const userTokenCheck = await axios.get('https://slack.com/api/auth.test', {
         headers: {
@@ -1721,12 +1995,7 @@ async function checkTokenValidity(connection, job) {
             console.log(`📋 User token has the following scopes: ${scopes.join(', ')}`);
             
             // Check for required scope based on channel type
-            let requiredScope = 'channels:history';
-            if (job.channelId.startsWith('G')) {
-              requiredScope = 'groups:history';
-            } else if (job.channelId.startsWith('D')) {
-              requiredScope = 'im:history';
-            }
+            let requiredScope = getRequiredScope(job.channelId);
             
             const hasRequiredScope = scopes.includes(requiredScope);
             console.log(`🔐 Required scope for channel ${job.channelId}: ${requiredScope} - Present: ${hasRequiredScope}`);
@@ -1888,8 +2157,6 @@ async function checkTokenValidity(connection, job) {
 
 // Schedule the history export job processor
 function startHistoryExportProcessor() {
-  console.log('📅 Starting history export job processor...');
-  
   // Run every 5 minutes to check for pending jobs
   cron.schedule('*/5 * * * *', () => {
     console.log('🔄 Running history export job processor...');
@@ -2104,10 +2371,12 @@ async function getChannelYearRange(accessToken, channelId, userToken = null) {
   let latestTs = null;
   try {
     // Get latest message (most recent)
-    let resp = await axios.get('https://slack.com/api/conversations.history', {
-      headers: { 'Authorization': `Bearer ${token}` },
-      params: { channel: channelId, limit: 1 }
-    });
+    let resp = await slackRateLimiter.makeRequest(async () => {
+      return await axios.get('https://slack.com/api/conversations.history', {
+        headers: { 'Authorization': `Bearer ${token}` },
+        params: { channel: channelId, limit: 1 }
+      });
+    }, `conversations.history for latest message in ${channelId}`);
     if (resp.data.ok && resp.data.messages.length > 0) {
       latestTs = parseFloat(resp.data.messages[0].ts);
     }
@@ -2119,10 +2388,12 @@ async function getChannelYearRange(accessToken, channelId, userToken = null) {
     while (hasMore) {
       const params = { channel: channelId, limit: 1000 };
       if (cursor) params.cursor = cursor;
-      const pageResp = await axios.get('https://slack.com/api/conversations.history', {
-        headers: { 'Authorization': `Bearer ${token}` },
-        params
-      });
+      const pageResp = await slackRateLimiter.makeRequest(async () => {
+        return await axios.get('https://slack.com/api/conversations.history', {
+          headers: { 'Authorization': `Bearer ${token}` },
+          params
+        });
+      }, `conversations.history for oldest message in ${channelId}`);
       if (pageResp.data.ok && pageResp.data.messages.length > 0) {
         lastTs = parseFloat(pageResp.data.messages[pageResp.data.messages.length - 1].ts);
       }
@@ -2139,4 +2410,21 @@ async function getChannelYearRange(accessToken, channelId, userToken = null) {
   const years = [];
   for (let y = oldestYear; y <= latestYear; y++) years.push(y);
   return years;
+}
+
+// Helper to determine required Slack scope for a channel
+function getRequiredScope(channelId) {
+  if (channelId.startsWith('G')) return 'groups:history';
+  if (channelId.startsWith('D')) return 'im:history';
+  return 'channels:history';
+}
+
+// Helper to extract display name from a Slack user object or message
+function getDisplayName(userObj, fallback = 'Unknown User') {
+  if (!userObj) return fallback;
+  if (userObj.display_name) return userObj.display_name;
+  if (userObj.real_name) return userObj.real_name;
+  if (userObj.name) return userObj.name;
+  if (typeof userObj === 'string') return userObj;
+  return fallback;
 }

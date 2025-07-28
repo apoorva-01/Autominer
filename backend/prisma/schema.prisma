@@ -4,7 +4,7 @@ generator client {
 
 datasource db {
   provider = "postgresql"
-  url      = "postgresql://apoorvaverma@localhost:5432/autominer"
+  url      = env("DATABASE_URL")
 }
 
 model User {
@@ -41,6 +41,9 @@ model SlackConnection {
   scrapingJobs      SlackScrapingJob[]
 
   @@unique([userId, slackTeamId])
+  @@index([slackTeamId])
+  @@index([userId])
+  @@index([isActive])
   @@map("slack_connections")
 }
 
@@ -62,6 +65,7 @@ model SlackScrapingJob {
   createdAt         DateTime        @default(now())
   updatedAt         DateTime        @updatedAt
   jobType           String?
+  params            String?         // Added field for job parameters (JSON string)
   slackConnection   SlackConnection @relation(fields: [slackConnectionId], references: [id], onDelete: Cascade)
 
   @@unique([slackConnectionId, channelId])
@@ -87,22 +91,40 @@ model SlackConversation {
   slackConnection   SlackConnection  @relation(fields: [slackConnectionId], references: [id], onDelete: Cascade)
 
   @@unique([slackConnectionId, messageTs])
+  @@index([slackConnectionId])
+  @@index([messageType])
+  @@index([userId])
+  @@index([channelId])
+  @@index([slackSentAt])
+  @@index([slackConnectionId, messageType])
+  @@index([slackConnectionId, channelId])
+  @@index([slackConnectionId, userId])
+  @@index([slackConnectionId, messageType, userId])
   @@map("slack_conversations")
 }
 
 model AutomationTask {
-  id                  String                 @id @default(cuid())
-  slackConversationId String
-  taskDescription     String
-  frequency           String
-  difficulty          String
-  estimatedRoi        String
-  suggestedTools      String[]
-  confidence          Float
-  status              String                 @default("pending")
-  createdAt           DateTime               @default(now())
-  reports             AutomationReportTask[]
-  slackConversation   SlackConversation      @relation(fields: [slackConversationId], references: [id], onDelete: Cascade)
+  id                        String                 @id @default(cuid())
+  slackConversationId       String
+  title                     String                 // Short, clear name for the task
+  taskDescription           String                 // Plain-English description of the repetitive action
+  currentManualSteps        String                 // Brief outline of how humans do it today
+  frequencyScore            Int                    // Integer from 1–5
+  automationEaseScore       Int                    // Integer from 1–5
+  priorityScore             Int                    // Frequency × Ease
+  suggestedAutomationApproach String               // Concrete idea for automation
+  estimatedTimeSaved        String                 // Rough minutes saved each time the automation runs
+  rationale                 String                 // 2–3 sentences explaining the scores and approach
+  frequency                 String                 // (legacy, can be kept for compatibility)
+  difficulty                String                 // (legacy, can be kept for compatibility)
+  estimatedRoi              String                 // (legacy, can be kept for compatibility)
+  suggestedTools            String[]
+  confidence                Float
+  status                    String                 @default("pending")
+  createdAt                 DateTime               @default(now())
+  analysisId                String?                // ID of the analysis run that created this task
+  reports                   AutomationReportTask[]
+  slackConversation         SlackConversation      @relation(fields: [slackConversationId], references: [id], onDelete: Cascade)
 
   @@map("automation_tasks")
 }
@@ -166,4 +188,50 @@ model SlackChannelGoogleDoc {
   slackChannelSelection SlackChannelSelection @relation(fields: [slackChannelSelectionId], references: [id], onDelete: Cascade)
 
   @@map("slack_channel_google_docs")
+}
+
+model Role {
+  id          String   @id @default(cuid())
+  name        String   @unique
+  description String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  departmentRoles DepartmentRole[]
+}
+
+model DepartmentAssignment {
+  id           String   @id @default(cuid())
+  userId       String
+  department   String
+  connectionId String
+  managerId    String? // new: manager (userId) for org chart
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  @@index([department])
+  @@index([connectionId])
+  @@index([userId])
+  @@index([managerId])
+  @@index([department, connectionId])
+}
+
+model DepartmentRole {
+  id           String   @id @default(cuid())
+  userId       String
+  department   String
+  roleId       String
+  slackTeamId  String   // changed from connectionId
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  role         Role     @relation(fields: [roleId], references: [id])
+}
+
+model Department {
+  id           String   @id @default(cuid())
+  name         String
+  description  String?
+  slackTeamId  String   // <-- changed from connectionId
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
 }

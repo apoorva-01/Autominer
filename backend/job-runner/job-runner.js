@@ -57,8 +57,6 @@ app.listen(PORT, () => {
 // Initialize and start all jobs
 async function initializeJobs() {
   try {
-    console.log('🔧 Initializing job runner...');
-    
     // Test database connection
     await prisma.$connect();
     console.log('✅ Database connection established');

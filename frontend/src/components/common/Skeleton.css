@@ -1,0 +1,30 @@
+.skeleton-loader {
+  background: linear-gradient(90deg, #f0f0f0 25%, #e0e0e0 37%, #f0f0f0 63%);
+  background-size: 200% 100%;
+  animation: skeleton-shimmer 1.2s linear infinite;
+  border-radius: 8px;
+  display: inline-block;
+  min-height: 1em;
+  min-width: 40px;
+  position: relative;
+  overflow: hidden;
+  transition: background 0.2s;
+}
+
+.skeleton-loader.rounded {
+  border-radius: 16px;
+}
+
+.skeleton-loader.circle {
+  border-radius: 50%;
+  aspect-ratio: 1 / 1;
+}
+
+@keyframes skeleton-shimmer {
+  0% {
+    background-position: -200% 0;
+  }
+  100% {
+    background-position: 200% 0;
+  }
+} 

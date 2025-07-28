@@ -6,10 +6,14 @@ const TABLES = [
   'automationReportTask',
   'automationReport',
   'automationTask',
+  'DepartmentRole',
+  'Department',
+  'DepartmentAssignment',
+  'Role',
   'slackConversation',
   'slackScrapingJob',
-  'slackChannelGoogleDoc',
-  'slackChannelSelection',
+  // 'slackChannelGoogleDoc',
+  // 'slackChannelSelection',
   // 'slackConnection',
   // 'user'
 ];

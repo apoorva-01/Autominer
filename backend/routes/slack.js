@@ -7,6 +7,9 @@ const { google } = require('googleapis');
 const router = express.Router();
 const prisma = new PrismaClient();
 
+// Define timeout for Slack API requests
+const API_TIMEOUT = 10000; // 10 seconds timeout for API calls
+
 // Global rate limiter for Slack API calls
 class SlackRateLimiter {
   constructor() {
@@ -679,22 +682,22 @@ router.get('/rate-limiter/status', authenticateToken, (req, res) => {
 router.get('/auth', authenticateToken, (req, res) => {
   const botScopes = [
     'channels:history',
+    'channels:join',
+    'channels:read',
+    'chat:write',
     'groups:history',
     'im:history',
-    'mpim:history',
-    'channels:read',
-    'groups:read',
-    'im:read',
-    'mpim:read',
-    'users:read',
-    'team:read'
+    'users:read'
   ].join(',');
   
   const userScopes = [
+    'channels:history',
     'channels:read',
+    'channels:write',
+    'groups:history',
     'groups:read',
     'im:read',
-    'mpim:read',
+    'mpim:history',
     'users:read'
   ].join(',');
 
@@ -963,6 +966,24 @@ router.post('/callback', async (req, res) => {
 // Get user's Slack connections
 router.get('/connections', authenticateToken, async (req, res) => {
   try {
+    // For admin users, fetch all connections
+    if (req.userRole === 'admin') {
+      const connections = await prisma.slackConnection.findMany({
+        select: {
+          id: true,
+          slackTeamId: true,
+          slackTeamName: true,
+          isActive: true,
+          createdAt: true,
+          scopes: true,
+          userId: true
+        }
+      });
+      
+      return res.json({ connections });
+    }
+    
+    // For regular users, only fetch their own connections
     const connections = await prisma.slackConnection.findMany({
       where: { userId: req.userId },
       select: {
@@ -971,7 +992,8 @@ router.get('/connections', authenticateToken, async (req, res) => {
         slackTeamName: true,
         isActive: true,
         createdAt: true,
-        scopes: true
+        scopes: true,
+        userId: true
       }
     });
 
@@ -1196,7 +1218,7 @@ router.get('/admin/all-channel-selections', authenticateToken, requireAdmin, asy
 // Admin: Export history for specific channel/DM
 router.post('/admin/export-channel-history', authenticateToken, requireAdmin, async (req, res) => {
   try {
-    const { connectionId, channelId, channelName, channelType, userId } = req.body;
+    const { connectionId, channelId, channelName, channelType, userId, range } = req.body;
 
     // Verify the channel selection exists and belongs to the specified user
     const selection = await prisma.slackChannelSelection.findFirst({
@@ -1226,6 +1248,10 @@ router.post('/admin/export-channel-history', authenticateToken, requireAdmin, as
     if (existingJob) {
       return res.status(400).json({ error: 'A history export job is already in progress for this channel.' });
     }
+    
+    // Create params JSON with range information
+    const params = range ? JSON.stringify({ range }) : null;
+    console.log(`📅 Creating history export job with range: ${params}`);
 
     // Create a scraping job for this specific channel
     const job = await prisma.slackScrapingJob.create({
@@ -1236,13 +1262,15 @@ router.post('/admin/export-channel-history', authenticateToken, requireAdmin, as
         channelType: channelType,
         jobType: 'history_export',
         status: 'pending',
+        params: params // Include the range parameter
       }
     });
 
     res.json({
       message: 'History export job created and queued for processing',
       jobId: job.id,
-      channelName: channelName || channelId
+      channelName: channelName || channelId,
+      range: range ? range.type : 'full'
     });
   } catch (error) {
     console.error('Admin export channel history error:', error);
@@ -1380,17 +1408,17 @@ router.get('/connections/:connectionId/channels', authenticateToken, async (req,
       return res.status(404).json({ error: 'Connection not found' });
     }
 
-    console.log('Found connection:', {
-      id: connection.id,
-      teamName: connection.slackTeamName,
-      isActive: connection.isActive,
-      hasToken: !!connection.accessToken,
-      scopes: connection.scopes,
-      tokenType: connection.accessToken?.substring(0, 5),
-      tokenLength: connection.accessToken?.length,
-      tokenPreview: connection.accessToken ? `${connection.accessToken.substring(0, 15)}...` : 'none',
-      fullTokenForDebug: connection.accessToken // TEMPORARY: Show full token for debugging
-    });
+    // console.log('Found connection:', {
+    //   id: connection.id,
+    //   teamName: connection.slackTeamName,
+    //   isActive: connection.isActive,
+    //   hasToken: !!connection.accessToken,
+    //   scopes: connection.scopes,
+    //   tokenType: connection.accessToken?.substring(0, 5),
+    //   tokenLength: connection.accessToken?.length,
+    //   tokenPreview: connection.accessToken ? `${connection.accessToken.substring(0, 15)}...` : 'none',
+    //   fullTokenForDebug: connection.accessToken // TEMPORARY: Show full token for debugging
+    // });
 
     const channels = await getSlackChannels(connection.userToken, connection.slackTeamId);
     const dms = await getSlackDMs(connection.userToken, connection.slackTeamId);
@@ -1517,82 +1545,6 @@ router.get('/connections/:connectionId/saved-channels', authenticateToken, async
   } catch (error) {
     console.error('Get saved channels error:', error);
     res.status(500).json({ error: 'Failed to retrieve saved channels' });
-  }
-});
-
-// Get channel fetching progress
-router.get('/connections/:connectionId/progress', authenticateToken, async (req, res) => {
-  try {
-    const { connectionId } = req.params;
-
-    const connection = await prisma.slackConnection.findFirst({
-      where: {
-        id: connectionId,
-        userId: req.userId
-      }
-    });
-
-    if (!connection) {
-      return res.status(404).json({ error: 'Connection not found' });
-    }
-
-    // Get selections with their scraping jobs
-    const selections = await prisma.slackChannelSelection.findMany({
-      where: {
-        slackConnectionId: connectionId,
-        userId: req.userId,
-        isActive: true
-      }
-    });
-
-    // Get scraping jobs for these selections
-    const jobs = await prisma.slackScrapingJob.findMany({
-      where: {
-        slackConnectionId: connectionId,
-        channelId: { in: selections.map(s => s.channelId) }
-      },
-      orderBy: { updatedAt: 'desc' }
-    });
-
-    // Calculate progress for each selection
-    const progressData = selections.map(selection => {
-      const relatedJobs = jobs.filter(job => job.channelId === selection.channelId);
-      const latestJob = relatedJobs[0];
-
-      return {
-        ...selection,
-        status: latestJob?.status || 'not_started',
-        progress: latestJob?.progress || 0,
-        messagesScraped: latestJob?.messagesScraped || 0,
-        lastFetchedAt: latestJob?.completedAt || selection.lastFetchedAt,
-        errorMessage: latestJob?.errorMessage
-      };
-    });
-
-    // Break down selections by type
-    const channelSelections = selections.filter(s => s.channelType === 'channel');
-    const dmSelections = selections.filter(s => s.channelType === 'dm');
-    
-    const overallStats = {
-      totalSelections: selections.length,
-      channelCount: channelSelections.length,
-      dmCount: dmSelections.length,
-      completed: progressData.filter(p => p.status === 'completed').length,
-      inProgress: progressData.filter(p => p.status === 'running').length,
-      pending: progressData.filter(p => p.status === 'pending' || p.status === 'not_started').length,
-      failed: progressData.filter(p => p.status === 'failed').length,
-      totalMessages: progressData.reduce((sum, p) => sum + (p.messagesScraped || 0), 0),
-      dailyExportEnabled: selections.some(s => s.dailyExportEnabled) // Check if any selection has daily export enabled
-    };
-
-    res.json({
-      progress: progressData,
-      stats: overallStats,
-      isActive: overallStats.inProgress > 0 || overallStats.pending > 0
-    });
-  } catch (error) {
-    console.error('Get progress error:', error);
-    res.status(500).json({ error: 'Failed to retrieve progress' });
   }
 });
 
@@ -2021,7 +1973,8 @@ async function getUsersMap(userToken, teamId) {
             'Authorization': `Bearer ${userToken}`,
             'Content-Type': 'application/json'
           },
-          params: params
+          params: params,
+          timeout: API_TIMEOUT
         });
       };
 
@@ -2034,7 +1987,7 @@ async function getUsersMap(userToken, teamId) {
         cursor = response.data.response_metadata?.next_cursor;
         hasMore = !!cursor;
         
-        console.log(`Fetched ${response.data.members.length} users (total so far: ${allUsers.length}), hasMore: ${hasMore}`);
+        // console.log(`Fetched ${response.data.members.length} users (total so far: ${allUsers.length}), hasMore: ${hasMore}`);
       } else {
         console.error('Failed to fetch users:', response.data.error);
         break;
@@ -2075,9 +2028,9 @@ async function getSlackChannels(userToken, teamId) {
   let hasMore = true;
 
   try {
-    console.log('Fetching Slack channels with user token...');
-    console.log('User token:', userToken ? `${userToken.substring(0, 20)}...` : 'missing');
-    console.log('Full user token for debug:', userToken); // TEMPORARY: Show full token
+    // console.log('Fetching Slack channels with user token...');
+    // console.log('User token:', userToken ? `${userToken.substring(0, 20)}...` : 'missing');
+    // console.log('Full user token for debug:', userToken); // TEMPORARY: Show full token
     
     while (hasMore) {
       const requestFn = async () => {
@@ -2096,19 +2049,20 @@ async function getSlackChannels(userToken, teamId) {
             'Authorization': `Bearer ${userToken}`,
             'Content-Type': 'application/json'
           },
-          params: params
+          params: params,
+          timeout: API_TIMEOUT
         });
       };
 
       const response = await slackRateLimiter.makeRequest(requestFn, 'fetch channels');
 
-      console.log('Slack channels API response:', {
-        ok: response.data.ok,
-        error: response.data.error,
-        channels_count: response.data.channels?.length || 0,
-        response_metadata: response.data.response_metadata,
-        cursor: cursor ? cursor.substring(0, 10) + '...' : 'none'
-      });
+      // console.log('Slack channels API response:', {
+      //   ok: response.data.ok,
+      //   error: response.data.error,
+      //   channels_count: response.data.channels?.length || 0,
+      //   response_metadata: response.data.response_metadata,
+      //   cursor: cursor ? cursor.substring(0, 10) + '...' : 'none'
+      // });
 
       if (response.data.ok) {
         const channels = response.data.channels.map(channel => ({
@@ -2128,7 +2082,7 @@ async function getSlackChannels(userToken, teamId) {
         cursor = response.data.response_metadata?.next_cursor;
         hasMore = !!cursor;
         
-        console.log(`Fetched ${channels.length} channels (total so far: ${allChannels.length}), hasMore: ${hasMore}`);
+        // console.log(`Fetched ${channels.length} channels (total so far: ${allChannels.length}), hasMore: ${hasMore}`);
       } else {
         console.error('Failed to fetch channels:', response.data.error);
         break;
@@ -2136,7 +2090,7 @@ async function getSlackChannels(userToken, teamId) {
     }
     
     console.log('Total channels fetched:', allChannels.length);
-    console.log('Sample channels:', allChannels.slice(0, 3));
+    // console.log('Sample channels:', allChannels.slice(0, 3));
     
     return allChannels;
   } catch (error) {
@@ -2176,19 +2130,20 @@ async function getSlackDMs(userToken, teamId) {
             'Authorization': `Bearer ${userToken}`,
             'Content-Type': 'application/json'
           },
-          params: params
+          params: params,
+          timeout: API_TIMEOUT
         });
       };
 
       const response = await slackRateLimiter.makeRequest(requestFn, 'fetch DMs');
 
-      console.log('Slack DMs API response:', {
-        ok: response.data.ok,
-        error: response.data.error,
-        channels_count: response.data.channels?.length || 0,
-        response_metadata: response.data.response_metadata,
-        cursor: cursor ? cursor.substring(0, 10) + '...' : 'none'
-      });
+      // console.log('Slack DMs API response:', {
+      //   ok: response.data.ok,
+      //   error: response.data.error,
+      //   channels_count: response.data.channels?.length || 0,
+      //   response_metadata: response.data.response_metadata,
+      //   cursor: cursor ? cursor.substring(0, 10) + '...' : 'none'
+      // });
 
       if (response.data.ok) {
         const dms = [];
@@ -2204,7 +2159,7 @@ async function getSlackDMs(userToken, teamId) {
 
           // For direct messages, use cached user data for name lookup
           if (dm.is_im && dm.user) {
-            const user = usersMap.get(dm.user);
+            let user = usersMap.get(dm.user);
             if (user) {
               if (user.deleted) {
                 dmInfo.name = `DM with ${user.real_name || user.name || 'Deleted User'}`;
@@ -2215,28 +2170,13 @@ async function getSlackDMs(userToken, teamId) {
                 dmInfo.name = `DM with ${userName}`;
               }
             } else {
-              // User not found in the map, try to get user info directly
-              console.log(`User ${dm.user} not found in users map, attempting direct lookup...`);
-              try {
-                const userInfoResponse = await axios.get('https://slack.com/api/users.info', {
-                  headers: {
-                    'Authorization': `Bearer ${userToken}`,
-                    'Content-Type': 'application/json'
-                  },
-                  params: {
-                    user: dm.user
-                  }
-                });
-                
-                if (userInfoResponse.data.ok && userInfoResponse.data.user) {
-                  const user = userInfoResponse.data.user;
-                  const userName = user.profile?.display_name || user.real_name || user.name;
-                  dmInfo.name = `DM with ${userName}`;
-                } else {
-                  dmInfo.name = `DM with ${dm.user}`;
-                }
-              } catch (userError) {
-                console.error(`Failed to get user info for ${dm.user}:`, userError.message);
+              // User not found in the map, try to get user info directly and cache it
+              user = usersMap.directLookup ? await usersMap.directLookup(dm.user) : null;
+              if (user) {
+                const userName = user.display_name || user.real_name || user.name;
+                dmInfo.name = `DM with ${userName}`;
+              } else {
+                console.log(`User ${dm.user} not found in users map or via direct lookup.`);
                 dmInfo.name = `DM with ${dm.user}`;
               }
             }
@@ -2256,7 +2196,7 @@ async function getSlackDMs(userToken, teamId) {
         cursor = response.data.response_metadata?.next_cursor;
         hasMore = !!cursor;
         
-        console.log(`Fetched ${dms.length} DMs (total so far: ${allDMs.length}), hasMore: ${hasMore}`);
+        // console.log(`Fetched ${dms.length} DMs (total so far: ${allDMs.length}), hasMore: ${hasMore}`);
       } else {
         console.error('Failed to fetch DMs:', response.data.error);
         break;
@@ -2264,7 +2204,7 @@ async function getSlackDMs(userToken, teamId) {
     }
 
     console.log('Total DMs fetched:', allDMs.length);
-    console.log('Sample DMs:', allDMs.slice(0, 3));
+    // console.log('Sample DMs:', allDMs.slice(0, 3));
     
     return allDMs;
   } catch (error) {
@@ -2511,10 +2451,10 @@ async function processScrapingJob(connection, job) {
       console.log(`Fetched ${messages.length} messages`);
 
       // Save messages to database and collect for Google Docs
+      await saveMessagesBatchToDatabase(connection.id, actualChannelId, channelInfo?.name, messages);
+      
+      // Collect valid messages for Google Docs (using refined filtering)
       for (const message of messages) {
-        await saveMessageToDatabase(connection.id, actualChannelId, channelInfo?.name, message);
-        
-        // Collect valid messages for Google Docs (using refined filtering)
         if (!message.bot_id && message.text && (!message.subtype || CAPTURE_MESSAGE_SUBTYPES.includes(message.subtype))) {
           allMessages.push(message);
         }
@@ -2535,13 +2475,11 @@ async function processScrapingJob(connection, job) {
               );
               
               // Save thread replies to database
+              await saveMessagesBatchToDatabase(connection.id, actualChannelId, channelInfo?.name, threadMessages);
               for (const threadMessage of threadMessages) {
-                await saveMessageToDatabase(connection.id, actualChannelId, channelInfo?.name, threadMessage);
-                
                 if (!threadMessage.bot_id && threadMessage.text && (!threadMessage.subtype || CAPTURE_MESSAGE_SUBTYPES.includes(threadMessage.subtype))) {
                   allMessages.push(threadMessage);
                 }
-                
                 totalMessages++;
               }
               
@@ -2550,7 +2488,7 @@ async function processScrapingJob(connection, job) {
             } catch (threadError) {
               console.warn(`⚠️ Failed to fetch thread replies for ${message.ts}:`, threadError.message);
               failedMessages++;
-            }
+            }s
           } else {
             console.log(`⏭️ Skipping thread fetch for old message ${message.ts} (older than 30 days)`);
           }
@@ -2564,7 +2502,7 @@ async function processScrapingJob(connection, job) {
         where: { id: job.id },
         data: {
           messagesScraped: totalMessages,
-          progress: Math.min(95, Math.floor((totalMessages / 1000) * 100)) // Estimate progress
+          progress: totalMessages > 0 ? Math.min(95, Math.max(1, Math.floor((totalMessages / 200) * 100))) : 0 // More responsive progress
         }
       });
 
@@ -2814,10 +2752,10 @@ async function processHistoryExportJob(connection, job) {
       console.log(`📚 History export fetched ${messages.length} messages (batch ${totalFetchAttempts})`);
 
       // Save messages to database and collect for Google Docs
+      await saveMessagesBatchToDatabase(connection.id, actualChannelId, channelInfo?.name, messages);
+      
+      // Collect ALL valid messages for Google Docs (no filtering by date)
       for (const message of messages) {
-        await saveMessageToDatabase(connection.id, actualChannelId, channelInfo?.name, message);
-        
-        // Collect ALL valid messages for Google Docs (no filtering by date)
         if (!message.bot_id && message.text && (!message.subtype || CAPTURE_MESSAGE_SUBTYPES.includes(message.subtype))) {
           allMessages.push(message);
         }
@@ -2833,13 +2771,11 @@ async function processHistoryExportJob(connection, job) {
             );
             
             // Save thread replies to database
+            await saveMessagesBatchToDatabase(connection.id, actualChannelId, channelInfo?.name, threadMessages);
             for (const threadMessage of threadMessages) {
-              await saveMessageToDatabase(connection.id, actualChannelId, channelInfo?.name, threadMessage);
-              
               if (!threadMessage.bot_id && threadMessage.text && (!threadMessage.subtype || CAPTURE_MESSAGE_SUBTYPES.includes(threadMessage.subtype))) {
                 allMessages.push(threadMessage);
               }
-              
               totalMessages++;
             }
             
@@ -2859,7 +2795,7 @@ async function processHistoryExportJob(connection, job) {
         where: { id: job.id },
         data: {
           messagesScraped: totalMessages,
-          progress: Math.min(95, Math.floor((totalMessages / 10000) * 100)) // Progress estimate for large exports
+          progress: totalMessages > 0 ? Math.min(95, Math.max(1, Math.floor((totalMessages / 500) * 100))) : 0 // More responsive progress
         }
       });
 
@@ -2988,7 +2924,8 @@ async function getChannelInfo(accessToken, channelId) {
       },
       params: {
         channel: channelId
-      }
+      },
+      timeout: API_TIMEOUT
     });
   };
 
@@ -3057,7 +2994,8 @@ async function fetchChannelMessages(accessToken, channelId, cursor = null, limit
         'Authorization': `Bearer ${token}`,
         'Content-Type': 'application/json'
       },
-      params: params
+      params: params,
+      timeout: API_TIMEOUT
     });
   };
 
@@ -3113,12 +3051,13 @@ async function fetchThreadReplies(accessToken, channelId, threadTs, userToken = 
         channel: channelId,
         ts: threadTs,
         limit: 1000
-      }
+      },
+      timeout: API_TIMEOUT
     });
   };
 
   try {
-    console.log(`🧵 Fetching thread replies for ${threadTs} using ${tokenType}...`);
+    // console.log(`🧵 Fetching thread replies for ${threadTs} using ${tokenType}...`);
     
     const response = await retryWithBackoff(async () => {
       return await slackRateLimiter.makeRequest(requestFn, `fetch thread replies for ${threadTs}`);
@@ -3170,49 +3109,25 @@ const CAPTURE_MESSAGE_SUBTYPES = [
   'thread_broadcast'       // Thread broadcasts
 ];
 
-async function saveMessageToDatabase(connectionId, channelId, channelName, message) {
-  try {
+// Batch insert messages to database
+async function saveMessagesBatchToDatabase(connectionId, channelId, channelName, messages) {
+  if (!messages || messages.length === 0) return;
+
+  // Prepare data for createMany
+  const data = messages.map(message => {
     // Enhanced message filtering with allowlist approach
-    if (message.bot_id) {
-      return; // Skip bot messages
-    }
-    
-    // Check if message subtype should be skipped
-    if (message.subtype && SKIP_MESSAGE_SUBTYPES.includes(message.subtype)) {
-      return;
-    }
-    
-    // For message_changed, use the updated message content
-    if (message.subtype === 'message_changed') {
-      message = message.message; // Use the updated message
-    }
+    if (message.bot_id) return null;
+    if (message.subtype && SKIP_MESSAGE_SUBTYPES.includes(message.subtype)) return null;
+    if (message.subtype === 'message_changed') message = message.message;
 
     // Determine message type
     let messageType = 'channel';
-    if (channelId.startsWith('D')) {
-      messageType = 'dm';
-    } else if (channelId.startsWith('G')) {
-      messageType = 'group';
-    }
-
-    // Check if message already exists
-    const existingMessage = await prisma.slackConversation.findFirst({
-      where: {
-        slackConnectionId: connectionId,
-        messageTs: message.ts
-      }
-    });
-
-    if (existingMessage) {
-      return; // Skip duplicate
-    }
+    if (channelId.startsWith('D')) messageType = 'dm';
+    else if (channelId.startsWith('G')) messageType = 'group';
 
     // Get user info if needed
     let userName = null;
-    if (message.user) {
-      // We could cache user info to avoid repeated API calls
-      userName = `user_${message.user}`;
-    }
+    if (message.user) userName = `user_${message.user}`;
 
     // Extract participants from thread or channel
     const participants = [];
@@ -3225,43 +3140,30 @@ async function saveMessageToDatabase(connectionId, channelId, channelName, messa
       });
     }
 
-    // If channelName is missing or 'Unknown', fetch from Slack
-    let finalChannelName = channelName;
-    if (!finalChannelName || finalChannelName === 'Unknown') {
-      const connection = await prisma.slackConnection.findFirst({ where: { id: connectionId } });
-      if (connection) {
-        const channelInfo = await getChannelInfo(connection.accessToken, channelId);
-        if (channelInfo && channelInfo.name) {
-          finalChannelName = channelInfo.name;
-        } else {
-          finalChannelName = 'Unknown';
-        }
-      } else {
-        finalChannelName = 'Unknown';
-      }
-    }
+    // Prepare the data object
+    return {
+      slackConnectionId: connectionId,
+      messageTs: message.ts,
+      channelId: channelId,
+      channelName: channelName || 'Unknown',
+      userId: message.user || 'unknown',
+      userName: userName,
+      messageText: message.text || '',
+      messageType: messageType,
+      threadTs: message.thread_ts || null,
+      participants: participants,
+      tags: [],
+      slackSentAt: message.ts ? new Date(parseFloat(message.ts) * 1000) : undefined
+    };
+  }).filter(Boolean); // Remove nulls (filtered out)
 
-    // Save to database
-    await prisma.slackConversation.create({
-      data: {
-        slackConnectionId: connectionId,
-        messageTs: message.ts,
-        channelId: channelId,
-        channelName: finalChannelName,
-        userId: message.user || 'unknown',
-        userName: userName,
-        messageText: message.text || '',
-        messageType: messageType,
-        threadTs: message.thread_ts || null,
-        participants: participants,
-        tags: [], // We could add AI-based tagging later
-        slackSentAt: message.ts ? new Date(parseFloat(message.ts) * 1000) : undefined
-      }
-    });
+  if (data.length === 0) return;
 
+  // Use createMany with skipDuplicates
+  try {
+    await prisma.slackConversation.createMany({ data, skipDuplicates: true });
   } catch (error) {
-    console.error('Error saving message to database:', error);
-    // Don't throw - continue with other messages
+    console.error('Error in batch saving messages:', error);
   }
 }
 
@@ -3305,14 +3207,14 @@ router.get('/google-docs/status', authenticateToken, async (req, res) => {
     let rootFolderName = process.env.GOOGLE_ROOT_FOLDER_NAME || 'Slack Automation Discovery';
     let authMethod = hasOAuth2 ? 'oauth2' : hasServiceAccount ? 'service_account' : 'none';
     
-    console.log('🔍 Google Drive status check:', {
-      hasOAuth2,
-      hasServiceAccount,
-      hasGoogleCredentials,
-      authMethod,
-      driveInitialized: !!drive,
-      docsInitialized: !!docs
-    });
+    // console.log('🔍 Google Drive status check:', {
+    //   hasOAuth2,
+    //   hasServiceAccount,
+    //   hasGoogleCredentials,
+    //   authMethod,
+    //   driveInitialized: !!drive,
+    //   docsInitialized: !!docs
+    // });
 
     if (hasGoogleCredentials && drive && docs) {
       try {
@@ -3330,11 +3232,11 @@ router.get('/google-docs/status', authenticateToken, async (req, res) => {
         
         googleDocsAccess = !!aboutResponse.data;
         
-        console.log('📋 Google Drive integration status:', {
-          user: aboutResponse.data.user?.emailAddress,
-          storageUsed: aboutResponse.data.storageQuota?.usage,
-          storageLimit: aboutResponse.data.storageQuota?.limit
-        });
+        // console.log('📋 Google Drive integration status:', {
+        //   user: aboutResponse.data.user?.emailAddress,
+        //   storageUsed: aboutResponse.data.storageQuota?.usage,
+        //   storageLimit: aboutResponse.data.storageQuota?.limit
+        // });
         
       } catch (apiError) {
         console.warn('Google APIs access test failed:', apiError.message);
@@ -3366,7 +3268,7 @@ router.get('/google-docs/status', authenticateToken, async (req, res) => {
       }
     };
     
-    console.log('📤 Sending Google Drive status response:', response);
+    // console.log('📤 Sending Google Drive status response:', response);
     res.json(response);
   } catch (error) {
     console.error('Error checking Google Docs status:', error);
@@ -3697,6 +3599,281 @@ router.delete('/admin/scraping-jobs/:jobId', authenticateToken, requireAdmin, as
   } catch (error) {
     console.error('Delete scraping job error:', error);
     res.status(500).json({ error: 'Failed to delete scraping job' });
+  }
+});
+
+router.getUsersMap = getUsersMap;
+
+// User-specific endpoints
+router.get('/user/connections', authenticateToken, async (req, res) => {
+  try {
+    // Ensure this only returns connections for the current user
+    const connections = await prisma.slackConnection.findMany({
+      where: { userId: req.userId },
+      select: {
+        id: true,
+        slackTeamId: true,
+        slackTeamName: true,
+        isActive: true,
+        createdAt: true,
+        scopes: true,
+        userId: true
+      }
+    });
+
+    res.json({ connections });
+  } catch (error) {
+    console.error('Get user connections error:', error);
+    res.status(500).json({ error: 'Failed to retrieve connections' });
+  }
+});
+
+router.delete('/user/connections/:connectionId', authenticateToken, async (req, res) => {
+  try {
+    const { connectionId } = req.params;
+
+    // Ensure the connection belongs to the current user
+    const connection = await prisma.slackConnection.findFirst({
+      where: {
+        id: connectionId,
+        userId: req.userId
+      }
+    });
+
+    if (!connection) {
+      return res.status(404).json({ error: 'Connection not found or does not belong to current user' });
+    }
+
+    // Delete the connection
+    await prisma.slackConnection.delete({
+      where: { id: connectionId }
+    });
+
+    res.json({ message: 'Connection deleted successfully' });
+  } catch (error) {
+    console.error('Delete connection error:', error);
+    res.status(500).json({ error: 'Failed to delete connection' });
+  }
+});
+
+// Admin-specific endpoints with dedicated paths
+router.get('/admin/connections', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const connections = await prisma.slackConnection.findMany({
+      include: {
+        user: {
+          select: {
+            id: true,
+            email: true,
+            name: true,
+            role: true
+          }
+        }
+      },
+      orderBy: {
+        createdAt: 'desc'
+      }
+    });
+
+    res.json({ connections });
+  } catch (error) {
+    console.error('Get admin connections error:', error);
+    res.status(500).json({ error: 'Failed to retrieve connections' });
+  }
+});
+
+// Get connections by team ID (for Analysis.jsx)
+router.get('/admin/connections-by-team', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const { slackTeamId } = req.query;
+    
+    if (!slackTeamId) {
+      return res.status(400).json({ error: 'slackTeamId is required' });
+    }
+    
+    console.log(`[DEBUG] Fetching connections for slackTeamId: ${slackTeamId}`);
+    
+    const connections = await prisma.slackConnection.findMany({
+      where: { slackTeamId },
+      include: {
+        user: {
+          select: {
+            id: true,
+            email: true,
+            name: true,
+            role: true
+          }
+        }
+      },
+      orderBy: {
+        createdAt: 'desc'
+      }
+    });
+
+    console.log(`[DEBUG] Found ${connections.length} connections for team ${slackTeamId}`);
+    
+    res.json({ connections });
+  } catch (error) {
+    console.error('Get connections by team error:', error);
+    console.error(error.stack);
+    res.status(500).json({ error: 'Failed to retrieve connections for team' });
+  }
+});
+
+router.delete('/admin/connections/:connectionId', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const { connectionId } = req.params;
+
+    // Check if connection exists
+    const connection = await prisma.slackConnection.findUnique({
+      where: { id: connectionId }
+    });
+
+    if (!connection) {
+      return res.status(404).json({ error: 'Connection not found' });
+    }
+
+    // Admin can delete any connection
+    await prisma.slackConnection.delete({
+      where: { id: connectionId }
+    });
+
+    res.json({ message: 'Connection deleted successfully' });
+  } catch (error) {
+    console.error('Delete admin connection error:', error);
+    res.status(500).json({ error: 'Failed to delete connection' });
+  }
+});
+
+// New batched endpoint to retrieve data for multiple connections in a single request
+router.post('/batch-data', authenticateToken, async (req, res) => {
+  try {
+    const { connectionIds } = req.body;
+    
+    if (!connectionIds || !Array.isArray(connectionIds) || connectionIds.length === 0) {
+      return res.status(400).json({ error: 'Valid connectionIds array is required' });
+    }
+    
+    // Verify all connections belong to the current user
+    const userConnections = await prisma.slackConnection.findMany({
+      where: { 
+        id: { in: connectionIds },
+        userId: req.userId 
+      }
+    });
+    
+    // Map for quick lookup of connections by ID
+    const connectionsMap = userConnections.reduce((map, conn) => {
+      map[conn.id] = conn;
+      return map;
+    }, {});
+    
+    // Process only connections that belong to the user
+    const validConnectionIds = userConnections.map(conn => conn.id);
+    
+    if (validConnectionIds.length === 0) {
+      return res.status(404).json({ error: 'No valid connections found' });
+    }
+
+    console.log(`Processing batch data request for ${validConnectionIds.length} connections`);
+    
+    // Batch fetch saved channels data
+    const savedChannelsData = {};
+    const selections = await prisma.slackChannelSelection.findMany({
+      where: {
+        slackConnectionId: { in: validConnectionIds },
+        userId: req.userId,
+        isActive: true
+      },
+      orderBy: { createdAt: 'desc' }
+    });
+    
+    // Group selections by connection ID
+    for (const selection of selections) {
+      if (!savedChannelsData[selection.slackConnectionId]) {
+        savedChannelsData[selection.slackConnectionId] = {
+          selectedChannels: [],
+          selectedDMs: [],
+          selections: []
+        };
+      }
+      
+      savedChannelsData[selection.slackConnectionId].selections.push(selection);
+      
+      if (selection.channelType === 'channel') {
+        savedChannelsData[selection.slackConnectionId].selectedChannels.push(selection.channelId);
+      } else if (selection.channelType === 'dm') {
+        savedChannelsData[selection.slackConnectionId].selectedDMs.push(selection.channelId);
+      }
+    }
+    
+    // Batch fetch channels info data
+    const channelsInfoData = {};
+    
+    // Process each connection in parallel using Promise.all for better performance
+    await Promise.all(validConnectionIds.map(async (connectionId) => {
+      const connection = connectionsMap[connectionId];
+      if (!connection || !connection.userToken) return;
+      
+      try {
+        // Fetch channels and DMs for this connection
+        const channels = await getSlackChannels(connection.userToken, connection.slackTeamId);
+        const dms = await getSlackDMs(connection.userToken, connection.slackTeamId);
+        
+        channelsInfoData[connectionId] = {
+          channels: channels || [],
+          dms: dms || [],
+          totalCount: (channels?.length || 0) + (dms?.length || 0)
+        };
+      } catch (error) {
+        console.error(`Error fetching channels for connection ${connectionId}:`, error);
+        channelsInfoData[connectionId] = { channels: [], dms: [], totalCount: 0, error: error.message };
+      }
+    }));
+    
+    // Return the combined data
+    res.json({
+      savedChannels: savedChannelsData,
+      channelsInfo: channelsInfoData,
+      processedConnections: validConnectionIds.length
+    });
+    
+  } catch (error) {
+    console.error('Batch data request error:', error);
+    res.status(500).json({ error: 'Failed to retrieve batch data' });
+  }
+});
+
+// Get all unique workspaces
+router.get('/workspaces', authenticateToken, async (req, res) => {
+  try {
+    // For admin users, fetch all workspaces
+    let whereClause = {};
+    if (req.userRole !== 'admin') {
+      // For regular users, only fetch their workspaces
+      whereClause.userId = req.userId;
+    }
+    
+    // Get unique workspaces
+    const connections = await prisma.slackConnection.findMany({
+      where: whereClause,
+      select: {
+        slackTeamId: true,
+        slackTeamName: true
+      },
+      distinct: ['slackTeamId']
+    });
+    
+    // Format the response
+    const workspaces = connections.map(conn => ({
+      id: conn.slackTeamId,
+      name: conn.slackTeamName
+    }));
+    
+    res.json({ workspaces });
+  } catch (error) {
+    console.error('Get workspaces error:', error);
+    res.status(500).json({ error: 'Failed to retrieve workspaces' });
   }
 });
 

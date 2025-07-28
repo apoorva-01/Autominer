@@ -25,10 +25,7 @@ router.post('/register', async (req, res) => {
     const hashedPassword = await bcrypt.hash(password, saltRounds);
 
     // Define admin emails
-    const adminEmails = [
-      'chirag.kataria@ecomexperts.io',
-      'andrew.durot@ecomexperts.io'
-    ];
+    const adminEmails = process.env.ADMIN_EMAILS ? process.env.ADMIN_EMAILS.split(',') : [];
     
     // Check if email is in admin list
     const userRole = adminEmails.includes(email.toLowerCase()) ? 'admin' : 'user';

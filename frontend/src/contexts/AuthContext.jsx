@@ -1,5 +1,6 @@
 import React, { createContext, useContext, useState, useEffect } from 'react';
 import axios from 'axios';
+import { useQueryClient } from 'react-query';
 
 const AuthContext = createContext();
 
@@ -15,6 +16,7 @@ export function AuthProvider({ children }) {
   const [user, setUser] = useState(null);
   const [loading, setLoading] = useState(true);
   const [token, setToken] = useState(localStorage.getItem('token'));
+  const queryClient = useQueryClient();
 
   useEffect(() => {
     if (token) {
@@ -85,6 +87,8 @@ export function AuthProvider({ children }) {
     setToken(null);
     setUser(null);
     delete axios.defaults.headers.common['Authorization'];
+    // Clear all React Query caches when logging out
+    queryClient.clear();
   };
 
   const value = {
